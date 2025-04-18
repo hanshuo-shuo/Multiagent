@@ -20,8 +20,6 @@ dones = {agent: False for agent in env.agents}
 while True:
     actions = {agent: env.action_space(agent).sample() for agent in env.agents}
     observations, rewards, dones, infos = env.step(actions)
+    print(observations)
     if dones["__all__"]:
         break
-
-
-

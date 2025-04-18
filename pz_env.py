@@ -1,6 +1,7 @@
 from pettingzoo.utils import ParallelEnv
 from gymnasium import spaces
 import numpy as np
+from env import DualEvadeObservation
 
 class MultiDualEvadeEnv(ParallelEnv):
     """
@@ -14,6 +15,9 @@ class MultiDualEvadeEnv(ParallelEnv):
         # instantiate the original single-agent env
         from env import DualEvadeEnv
         self.inner_env = DualEvadeEnv(**dual_evade_kwargs)
+        
+        # Create another observation object for the second agent
+        self.prey2_observation = DualEvadeObservation()
 
         # define agent names
         self.agents = ["prey_1", "prey_2"]
@@ -28,9 +32,19 @@ class MultiDualEvadeEnv(ParallelEnv):
     def reset(self, seed=None, options=None):
         # reset inner env
         obs0, _ = self.inner_env.reset(options=options, seed=seed)
-        # both agents observe the same initial obs
+        # Get initial observations for both agents
         self.agents = list(self.possible_agents)
-        observations = {agent: obs0.copy() for agent in self.agents}
+        
+        # For prey_1, use the observation returned by the inner env
+        prey1_obs = obs0.copy()
+        
+        # For prey_2, generate a swapped observation
+        prey2_obs = self.__get_prey2_observation()
+        
+        observations = {
+            "prey_1": prey1_obs,
+            "prey_2": prey2_obs
+        }
         return observations
 
     def step(self, actions):
@@ -42,14 +56,38 @@ class MultiDualEvadeEnv(ParallelEnv):
         # step inner env with primary agent's action
         obs, reward, done, truncated, info = self.inner_env.step(action_prey1)
 
+        # Get prey_1's observation
+        prey1_obs = obs.copy()
+        
+        # Get prey_2's observation
+        prey2_obs = self.__get_prey2_observation()
+        
         # build parallel return
-        observations = {agent: obs.copy() for agent in self.agents}
+        observations = {
+            "prey_1": prey1_obs,
+            "prey_2": prey2_obs
+        }
         rewards = {agent: reward for agent in self.agents}
         # done flags per agent
         dones = {agent: done for agent in self.agents}
         dones["__all__"] = done
         infos = {agent: info for agent in self.agents}
         return observations, rewards, dones, infos
+        
+    def __get_prey2_observation(self):
+        """Generate the observation from prey_2's perspective"""
+        # Get the model from inner_env
+        model = self.inner_env.model
+        
+        # Update observation for prey_2 perspective
+        self.inner_env.__update_observation__(
+            observation=self.prey2_observation,
+            prey=model.prey_2,
+            prey_data=model.prey_data_2,
+            other=model.prey_1
+        )
+        
+        return self.prey2_observation.copy()
 
     def render(self):
         # delegate to inner env's render via model
