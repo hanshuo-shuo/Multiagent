@@ -18,6 +18,9 @@ class MultiDualEvadeEnv(ParallelEnv):
         
         # Create another observation object for the second agent
         self.prey2_observation = DualEvadeObservation()
+        
+        # Store the reward function
+        self.reward_function = self.inner_env.reward_function
 
         # define agent names
         self.agents = ["prey_1", "prey_2"]
@@ -45,7 +48,8 @@ class MultiDualEvadeEnv(ParallelEnv):
             "prey_1": prey1_obs,
             "prey_2": prey2_obs
         }
-        return observations
+        infos = {agent: {} for agent in self.agents}
+        return observations, infos
 
     def step(self, actions):
         # actions: dict mapping agent to its chosen action
@@ -54,7 +58,7 @@ class MultiDualEvadeEnv(ParallelEnv):
         # inject other agent action via inner_env.set_other_policy
         self.inner_env.set_other_policy(lambda obs: action_prey2)
         # step inner env with primary agent's action
-        obs, reward, done, truncated, info = self.inner_env.step(action_prey1)
+        obs, reward_prey1, terminated, truncated, info = self.inner_env.step(action_prey1)
 
         # Get prey_1's observation
         prey1_obs = obs.copy()
@@ -62,17 +66,23 @@ class MultiDualEvadeEnv(ParallelEnv):
         # Get prey_2's observation
         prey2_obs = self.__get_prey2_observation()
         
+        # Calculate reward for prey_2 using its observation
+        reward_prey2 = self.reward_function(prey2_obs)
+        
         # build parallel return
         observations = {
             "prey_1": prey1_obs,
             "prey_2": prey2_obs
         }
-        rewards = {agent: reward for agent in self.agents}
-        # done flags per agent
-        dones = {agent: done for agent in self.agents}
-        dones["__all__"] = done
-        infos = {agent: info for agent in self.agents}
-        return observations, rewards, dones, infos
+        rewards = {
+            "prey_1": reward_prey1,
+            "prey_2": reward_prey2
+        }
+        # terminated and truncated flags per agent
+        terminations = {agent: terminated for agent in self.agents}
+        truncations = {agent: truncated for agent in self.agents}
+        infos = {agent: info.copy() if info else {} for agent in self.agents}
+        return observations, rewards, terminations, truncations, infos
         
     def __get_prey2_observation(self):
         """Generate the observation from prey_2's perspective"""

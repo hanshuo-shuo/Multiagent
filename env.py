@@ -60,20 +60,6 @@ class Observation(np.ndarray):
             return np.ndarray.__getitem__(self, field)
 
 
-class Reward(object):
-    def __init__(self,
-                 reward_structure: dict):
-        self.reward_structure = reward_structure
-
-    def __call__(self, observation: Observation) -> float:
-        reward = 0.0
-        for field, multiplier in self.reward_structure.items():
-            offset = 0
-            if isinstance(multiplier, list):
-                offset = multiplier[1]
-                multiplier = multiplier[0]
-            reward += offset + multiplier * observation[observation.field_enum[field].value]
-        return reward
 
 
 class Environment(Env):
@@ -112,7 +98,7 @@ class DualEvadeObservation(Observation):
               "predator_y",
               "predator_direction",
               "prey_goal_distance",
-              "predator_prey_distance",
+            #   "predator_prey_distance",
               "puffed",
               "puff_cooled_down",
               "finished"]
@@ -206,7 +192,8 @@ class DualEvadeEnv(Environment):
             observation.predator_direction = 0
 
         observation.prey_goal_distance = prey_data.prey_goal_distance
-        observation.predator_prey_distance = prey_data.predator_prey_distance
+        # observation.predator_prey_distance = prey_data.predator_prey_distance
+
         observation.puffed = prey_data.puffed
         observation.puff_cooled_down = self.model.puff_cool_down
         observation.finished = not self.model.running
