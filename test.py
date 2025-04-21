@@ -20,6 +20,7 @@ if __name__ == "__main__":
         action = env.action_space.sample()
         for j in range(10):
             env.step(action=action)
+            step_count += 1
 
     total_time = time.time() - start_time
 
