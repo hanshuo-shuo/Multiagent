@@ -17,7 +17,7 @@ actor_net = nn.Sequential(
     nn.ReLU(),
     nn.Linear(hidden_sizes[1], action_dim * 2)  # mean + log_std
 )
-actor = ActorProb(actor_net, action_shape=action_dim, max_action=1.0, device=device)
+actor = ActorProb(actor_net, action_shape=(action_dim,), max_action=1.0, device=device)
 
 # critics
 critic1 = Critic(nn.Sequential(
