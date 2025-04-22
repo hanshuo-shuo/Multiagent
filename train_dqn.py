@@ -38,76 +38,6 @@ def custom_reward(obs):
 
     return reward
 
-# 自定义多智能体策略管理器
-class MultiAgentDQNPolicyManager:
-    """
-    多智能体DQN策略管理器，用于处理多个智能体的策略
-    """
-    def __init__(self, policies):
-        """
-        初始化多智能体策略管理器
-        policies: 字典，键为智能体ID，值为对应的策略
-        """
-        self.policies = policies
-        self.agent_ids = list(policies.keys())
-    
-    def forward(self, batch, state=None, **kwargs):
-        """
-        根据智能体ID分发观测到对应的策略
-        """
-        results = {}
-        
-        # 对每个智能体进行前向传播
-        for agent_id in self.agent_ids:
-            if agent_id in batch:
-                policy = self.policies[agent_id]
-                results[agent_id] = policy(batch[agent_id], state, **kwargs)
-        
-        return Batch(results)
-    
-    def learn(self, batch, **kwargs):
-        """
-        训练所有策略
-        """
-        results = {}
-        total_loss = 0.0
-        
-        # 为每个智能体独立更新策略
-        for agent_id, policy in self.policies.items():
-            if agent_id in batch:
-                result = policy.learn(batch[agent_id], **kwargs)
-                results[agent_id] = result
-                if isinstance(result, dict) and "loss" in result:
-                    total_loss += result["loss"]
-                else:
-                    total_loss += result
-        
-        # 返回所有策略的平均损失
-        return total_loss / len(self.policies) if self.policies else 0.0
-    
-    def set_eps(self, eps):
-        """设置所有策略的探索率"""
-        for policy in self.policies.values():
-            policy.set_eps(eps)
-    
-    def train(self):
-        """设置为训练模式"""
-        for policy in self.policies.values():
-            policy.train()
-    
-    def eval(self):
-        """设置为评估模式"""
-        for policy in self.policies.values():
-            policy.eval()
-    
-    def update(self, sample_size=10, **kwargs):
-        """更新所有策略"""
-        losses = []
-        for policy in self.policies.values():
-            loss = policy.update(sample_size=sample_size, **kwargs)
-            losses.append(loss)
-        return sum(losses) / len(losses) if losses else 0.0
-
 # 设置随机种子
 def set_seed(seed):
     np.random.seed(seed)
@@ -172,7 +102,7 @@ def make_env_fn(world="21_05", use_pred=True, render=False):
             world_name=world,
             use_lppos=True,
             use_predator=use_pred,
-            max_step=50,
+            max_step=300,
             reward_function=custom_reward,
             time_step=0.25,
             render=render,
@@ -216,6 +146,62 @@ def make_dqn_policy(net, action_space, device='cpu', lr=3e-4, gamma=0.99,
     )
     
     return policy
+
+def calculate_returns(rewards, gamma, dones, next_values=None, n_step=1):
+    """
+    计算n步回报，按照 Tianshou 的实现方式
+    
+    Args:
+        rewards: 单个步骤的奖励列表
+        gamma: 折扣因子
+        dones: 是否终止的布尔列表
+        next_values: 下一个状态的价值估计，用于bootstrapping
+        n_step: 计算几步返回值
+        
+    Returns:
+        returns: 计算出的回报值
+    """
+    returns = np.zeros_like(rewards)
+    
+    # 处理单步情况
+    if len(rewards) == 1:
+        if dones[0]:
+            # 如果是终止状态，则只有即时奖励
+            return rewards
+        else:
+            # 如果非终止状态，且提供了下一状态的价值，则使用TD目标
+            if next_values is not None:
+                return rewards + gamma * (1 - dones) * next_values
+            return rewards
+    
+    # 多步情况
+    T = len(rewards)
+    for i in range(T):
+        if dones[i]:
+            # 如果当前状态是终止状态，则只用即时奖励
+            returns[i] = rewards[i]
+            continue
+            
+        # 计算n步回报
+        n_actual = min(n_step, T - i)
+        ret = 0
+        for j in range(n_actual):
+            # 累加未来n步的折扣奖励
+            if i + j < T:
+                ret += (gamma ** j) * rewards[i + j]
+                # 如果碰到终止状态，则停止累加
+                if i + j < T and dones[i + j]:
+                    break
+        
+        # 如果没到终止状态并且还能继续往后看，则加上bootstrapping项
+        if i + n_actual < T and not dones[i + n_actual - 1]:
+            if next_values is not None and i + n_actual < len(next_values):
+                # 使用给定的下一状态价值估计进行bootstrapping
+                ret += (gamma ** n_actual) * next_values[i + n_actual]
+                
+        returns[i] = ret
+        
+    return returns
 
 def train_dqn_agents(args):
     """并行训练多个DQN智能体"""
@@ -279,13 +265,14 @@ def train_dqn_agents(args):
     
     # 训练循环
     print("\n开始训练...")
+    total_steps = 0  # 记录总步数，用于计算epsilon
+    
     for epoch in range(args.epoch):
         print(f"\n开始Epoch {epoch+1}/{args.epoch}")
         
         # 设置训练模式
         for agent_id, policy in agents.items():
             policy.train()
-            policy.set_eps(args.eps_train)
         
         # 每个智能体的累积回报
         epoch_returns = {agent_id: [] for agent_id in env.agents}
@@ -300,6 +287,13 @@ def train_dqn_agents(args):
                 # 为每个智能体选择动作
                 actions = {}
                 for agent_id, policy in agents.items():
+                    # 计算当前的探索率 - 线性衰减
+                    current_eps = max(args.eps_min, args.eps_start - 
+                                   (args.eps_start - args.eps_min) * min(1.0, total_steps / args.eps_decay_steps))
+                    
+                    # 设置当前的探索率
+                    policy.set_eps(current_eps)
+                    
                     # 转换观测为tensor
                     obs_tensor = torch.tensor(
                         obs_dict[agent_id], 
@@ -317,16 +311,23 @@ def train_dqn_agents(args):
                 
                 # 执行动作
                 next_obs_dict, rewards, terminations, truncations, infos, done = env.step(actions)
+                total_steps += 1
                 
                 # 为每个智能体存储经验
                 for agent_id in env.agents:
-                    # 计算n步return (简化版的计算)
+                    # 计算n步return 
                     rew = rewards[agent_id]
                     done_flag = terminations[agent_id] or truncations[agent_id]
                     
-                    # 这里我们不直接计算returns，让DQN算法内部处理
-                    # DQN会根据rew, done和下一个状态计算TD目标
-                    # returns字段只是为了兼容性，实际上DQN不会直接使用它
+                    # 对单个步骤，正确的TD目标是即时奖励加上折扣的下一状态价值
+                    # 由于目前我们没有下一状态的价值，这里只能暂时使用即时奖励
+                    # 完整的TD目标在训练循环中的batch更新部分计算
+                    return_value = calculate_returns(
+                        np.array([rew]), 
+                        args.gamma, 
+                        np.array([done_flag]), 
+                        n_step=1
+                    )[0]
                     
                     # 创建经验
                     experience = Batch(
@@ -338,8 +339,8 @@ def train_dqn_agents(args):
                         done=np.array([done_flag], dtype=np.bool_),
                         obs_next=np.array([next_obs_dict[agent_id]], dtype=np.float32),
                         info=np.array([{}]),
-                        # 我们还是提供returns字段，但它的值在DQN算法中可能不会直接使用
-                        returns=np.array([rew], dtype=np.float32)  # 实际上DQN内部会重新计算TD目标
+                        # 使用计算好的return值
+                        returns=np.array([return_value], dtype=np.float32)
                     )
                     
                     # 添加到缓冲区
@@ -362,6 +363,16 @@ def train_dqn_agents(args):
             # 选择动作
             actions = {}
             for agent_id, policy in agents.items():
+                # 计算当前的探索率 - 线性衰减
+                current_eps = max(args.eps_min, args.eps_start - 
+                               (args.eps_start - args.eps_min) * min(1.0, total_steps / args.eps_decay_steps))
+                
+                if i % 100 == 0:  # 每100步打印一次当前探索率
+                    print(f"当前步数: {total_steps}, 探索率 (epsilon): {current_eps:.4f}")
+                
+                # 设置当前的探索率
+                policy.set_eps(current_eps)
+                
                 # 转换观测为tensor
                 obs_tensor = torch.tensor(
                     obs_dict[agent_id], 
@@ -379,6 +390,7 @@ def train_dqn_agents(args):
             
             # 执行动作
             next_obs_dict, rewards, terminations, truncations, infos, done = env.step(actions)
+            total_steps += 1
             
             # 更新累积奖励
             for agent_id in env.agents:
@@ -388,12 +400,19 @@ def train_dqn_agents(args):
             
             # 为每个智能体存储经验
             for agent_id in env.agents:
-                # 计算n步return (简化版的计算)
+                # 计算n步return
                 rew = rewards[agent_id]
                 done_flag = terminations[agent_id] or truncations[agent_id]
                 
-                # 这里同样不直接计算returns
-                # DQN策略内部会根据reward, done和下一状态计算TD目标
+                # 对单个步骤，正确的TD目标是即时奖励加上折扣的下一状态价值
+                # 由于目前我们没有下一状态的价值，这里只能暂时使用即时奖励
+                # 完整的TD目标在训练循环中的batch更新部分计算
+                return_value = calculate_returns(
+                    np.array([rew]), 
+                    args.gamma, 
+                    np.array([done_flag]), 
+                    n_step=1
+                )[0]
                 
                 # 创建经验
                 experience = Batch(
@@ -405,8 +424,8 @@ def train_dqn_agents(args):
                     done=np.array([done_flag], dtype=np.bool_),
                     obs_next=np.array([next_obs_dict[agent_id]], dtype=np.float32),
                     info=np.array([{}]),
-                    # 提供returns字段，但实际上DQN内部会重新计算TD目标
-                    returns=np.array([rew], dtype=np.float32)
+                    # 使用计算好的return值
+                    returns=np.array([return_value], dtype=np.float32)
                 )
                 
                 # 添加到缓冲区
@@ -444,9 +463,30 @@ def train_dqn_agents(args):
                                 
                                 # 确保batch包含必要字段
                                 if not hasattr(batch, 'returns') or batch.returns is None:
-                                    # 这里实际上DQN会内部计算TD目标
-                                    # 我们只是为了满足tianshou的接口要求提供一个初始值
-                                    batch.returns = batch.rew
+                                    # 这里我们需要通过DQN的target网络计算下一个状态的价值估计
+                                    with torch.no_grad():
+                                        # 获取下一个状态的观测
+                                        next_obs = batch.obs_next
+                                        
+                                        # 使用policy的target网络计算价值估计
+                                        # DQN的情况，我们取每个动作价值的最大值作为状态价值
+                                        target_q = policy(Batch(
+                                            obs=next_obs, 
+                                            info={},  # 添加空的info字段以避免错误
+                                        )).logits.max(dim=1)[0]
+                                        target_q = target_q.cpu().numpy()
+                                    
+                                    # 计算returns
+                                    batch.returns = calculate_returns(
+                                        batch.rew.flatten().numpy() if torch.is_tensor(batch.rew) else batch.rew.flatten(),
+                                        args.gamma,
+                                        batch.done.flatten().numpy() if torch.is_tensor(batch.done) else batch.done.flatten(),
+                                        next_values=target_q,
+                                        n_step=args.n_step
+                                    )
+                                    batch.returns = torch.tensor(
+                                        batch.returns, dtype=torch.float32, device=device
+                                    ).reshape(-1, 1)
                                 
                                 # 更新策略 - DQN内部会计算真正的Q值目标
                                 losses = policy.learn(batch)
@@ -714,20 +754,22 @@ if __name__ == "__main__":
     # 训练参数
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epoch", type=int, default=10)
-    parser.add_argument("--step-per-epoch", type=int, default=5000)
-    parser.add_argument("--update-freq", type=int, default=10)
-    parser.add_argument("--update-per-step", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--step-per-epoch", type=int, default=6000)
+    parser.add_argument("--update-freq", type=int, default=1)
+    parser.add_argument("--update-per-step", type=float, default=1)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
     parser.add_argument("--test-num", type=int, default=10)
     parser.add_argument("--buffer-size", type=int, default=500000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--n-step", type=int, default=3)
+    parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--target-update-freq", type=int, default=100)
-    parser.add_argument("--eps-train", type=float, default=0.1)
+    parser.add_argument("--eps-start", type=float, default=1.0, help="初始探索率")
+    parser.add_argument("--eps-min", type=float, default=0.05, help="最小探索率")
+    parser.add_argument("--eps-decay", type=float, default=0.95, help="每个epoch的探索率衰减因子")
+    parser.add_argument("--eps-decay-steps", type=int, default=20000, help="探索率从初始值衰减到最小值所需的总步数")
     parser.add_argument("--eps-test", type=float, default=0.05)
-    # parser.add_argument("--reward-threshold", type=float, default=0.9)
     parser.add_argument("--no-predator", action="store_true", help="禁用捕食者")
     parser.add_argument("--logdir", type=str, default="./log")
     parser.add_argument("--save-path", type=str, default="./log/dqn/policy")
