@@ -16,7 +16,7 @@ from reward import custom_reward
 # Hyperparameters
 lr_pi = 0.0003
 lr_q = 0.0003
-init_alpha = 0.2
+init_alpha = 1
 gamma = 0.99
 batch_size = 256
 buffer_limit = 1000000
@@ -26,17 +26,29 @@ lr_alpha = 0.0003  # for automated alpha update
 train_interval = 1  # 每个智能体每隔多少步进行一次训练
 update_iterations = 1  # 每次训练更新多少次
 num_gradients_per_step = 1  # 每步环境交互执行的梯度更新次数
-start_training = 5000  # 开始训练前需要收集的经验数量
+start_training = 1000  # 开始训练前需要收集的经验数量
 print_interval = 10  # 每多少个episode打印一次结果
-max_episodes = 300  # 最大训练回合数
+max_episodes = 1000  # 最大训练回合数
 max_steps = 300  # 每个回合最大步数
-save_interval = 10  # 每多少个episode保存一次模型
+save_interval = 100  # 每多少个episode保存一次模型
 model_path = "log/sac"  # 模型保存路径
 hidden_dim = 256  # 隐藏层维度
 reward_scale = 1.0  # 奖励缩放系数，用于调整熵正则化的影响
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"{'GPU is' if torch.cuda.is_available() else 'GPU is not'} available, using {'GPU' if torch.cuda.is_available() else 'CPU'} instead")
+
+def weights_init_(m, gain=1):
+    """
+    权重初始化函数，使用Xavier/Glorot初始化
+    
+    参数:
+    - m: 网络模块
+    - gain: 增益系数，控制初始化的方差
+    """
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight, gain=gain)
+        nn.init.constant_(m.bias, 0)
 
 class ReplayBuffer:
     def __init__(self):
@@ -79,10 +91,16 @@ class PolicyNet(nn.Module):
         super(PolicyNet, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.fc_mu = nn.Linear(hidden_dim, action_dim)
         self.fc_std = nn.Linear(hidden_dim, action_dim)
         self.optimizer = optim.Adam(self.parameters(), lr=lr_pi)
+        
+        # 初始化网络权重
+        self.apply(lambda m: weights_init_(m, gain=np.sqrt(2)))  # 隐藏层使用sqrt(2)增益
+        # mu层使用较小的增益以产生更小的初始动作
+        weights_init_(self.fc_mu, gain=0.01)  
+        # std层也使用较小的增益以产生合理的初始方差
+        weights_init_(self.fc_std, gain=0.01)
         
         # For automated entropy tuning
         self.action_bound = action_bound
@@ -94,7 +112,6 @@ class PolicyNet(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x)) + 1e-3  # To avoid std being too small
         
@@ -148,16 +165,23 @@ class QNet(nn.Module):
         self.fc_s = nn.Linear(state_dim, hidden_dim)
         self.fc_a = nn.Linear(action_dim, hidden_dim)
         self.fc_cat = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.fc_hidden = nn.Linear(hidden_dim, hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, 1)
         self.optimizer = optim.Adam(self.parameters(), lr=lr_q)
+        
+        # 初始化网络权重
+        # 状态和动作编码层使用sqrt(2)增益
+        weights_init_(self.fc_s, gain=np.sqrt(2))
+        weights_init_(self.fc_a, gain=np.sqrt(2))
+        # 合并层使用sqrt(2)增益
+        weights_init_(self.fc_cat, gain=np.sqrt(2))
+        # 输出层使用默认增益
+        weights_init_(self.fc_out, gain=1.0)
 
     def forward(self, x, a):
         h1 = F.relu(self.fc_s(x))
         h2 = F.relu(self.fc_a(a))
         cat = torch.cat([h1, h2], dim=1)
         q = F.relu(self.fc_cat(cat))
-        q = F.relu(self.fc_hidden(q))
         q = self.fc_out(q)
         return q
 
@@ -300,6 +324,76 @@ def plot_training_results(scores, success_rates, save_path=None, window_size=5):
     # 显示图表
     plt.show()
 
+def evaluate_policy(env, agents, num_episodes=10, max_steps=300, render=False):
+    """
+    评估策略性能，使用确定性策略（均值而非采样）
+    
+    参数:
+    - env: 评估环境
+    - agents: 智能体模型字典
+    - num_episodes: 评估回合数
+    - max_steps: 每回合最大步数
+    - render: 是否渲染环境
+    
+    返回:
+    - avg_rewards: 各智能体的平均奖励
+    - success_rates: 各智能体的成功率
+    """
+    avg_rewards = {agent_name: 0 for agent_name in agents.keys()}
+    success_counts = {agent_name: 0 for agent_name in agents.keys()}
+    
+    for episode in range(num_episodes):
+        observations, infos = env.reset()
+        episode_rewards = {agent_name: 0 for agent_name in agents.keys()}
+        
+        done = False
+        step = 0
+        
+        while not done and step < max_steps:
+            actions = {}
+            
+            # 使用确定性策略（均值而非采样）
+            for agent_name in agents.keys():
+                pi, *_ = agents[agent_name]
+                obs = torch.tensor(observations[agent_name], dtype=torch.float32).unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    # 获取均值动作（不使用采样）
+                    mu = torch.tanh(pi.fc_mu(F.relu(pi.fc2(F.relu(pi.fc1(obs)))))) * pi.action_bound
+                    actions[agent_name] = mu.squeeze().cpu().numpy()
+            
+            # 执行动作
+            next_observations, rewards, terminations, truncations, infos = env.step(actions)
+            
+            # 更新统计
+            for agent_name in agents.keys():
+                episode_rewards[agent_name] += rewards[agent_name]
+            
+            # 更新观测
+            observations = next_observations
+            
+            # 如果需要渲染
+            if render:
+                env.render()
+            
+            # 检查是否结束
+            done = all(terminations.values()) or all(truncations.values())
+            step += 1
+        
+        # 累计奖励和成功次数
+        for agent_name in agents.keys():
+            avg_rewards[agent_name] += episode_rewards[agent_name]
+            if agent_name in infos and "is_success" in infos[agent_name] and infos[agent_name]["is_success"]:
+                success_counts[agent_name] += 1
+    
+    # 计算平均值
+    for agent_name in agents.keys():
+        avg_rewards[agent_name] /= num_episodes
+    
+    success_rates = {agent_name: success_counts[agent_name] / num_episodes for agent_name in agents.keys()}
+    
+    return avg_rewards, success_rates
+
 def main(args):
     
     # 创建环境
@@ -319,162 +413,200 @@ def main(args):
     
     env = MultiDualEvadeEnv(**env_kwargs)
     
-    # 创建经验回放缓冲区
-    memory = {agent: ReplayBuffer() for agent in env.agents}
-    
     # 获取观测和动作空间的维度
     agent = env.agents[0]  # 所有智能体的观测和动作空间都相同
     obs_dim = env.observation_spaces[agent].shape[0]
     act_dim = env.action_spaces[agent].shape[0]
     act_bound = 1.0  # 动作取值范围在[0,1]
     
-    # 为每个智能体创建SAC模型
-    agents = {}
-    for agent_name in env.agents:
-        pi = PolicyNet(obs_dim, act_dim, act_bound).to(device)
-        q1, q2 = QNet(obs_dim, act_dim).to(device), QNet(obs_dim, act_dim).to(device)
-        q1_target, q2_target = QNet(obs_dim, act_dim).to(device), QNet(obs_dim, act_dim).to(device)
-        
-        # 初始化目标网络
-        q1_target.load_state_dict(q1.state_dict())
-        q2_target.load_state_dict(q2.state_dict())
-        
-        agents[agent_name] = (pi, q1, q2, q1_target, q2_target)
-    
     # 如果模型路径不存在则创建
     if not os.path.exists(model_path):
         os.makedirs(model_path)
     
-    # 统计指标
-    scores = {agent: [] for agent in env.agents}
-    success_rates = {agent: [] for agent in env.agents}
-    episode_score = {agent: 0 for agent in env.agents}
-    episode_success = {agent: 0 for agent in env.agents}
-    
-    total_step = 0
-    gradient_steps = 0
-    
-    for n_epi in range(1, max_episodes+1):
-        observations, infos = env.reset()
+    # 根据模式选择操作
+    if args.mode == 'train':
+        # 训练模式：执行原来的训练流程
         
-        # 重置每个回合的统计
-        for agent in env.agents:
-            episode_score[agent] = 0
+        # 创建经验回放缓冲区
+        memory = {agent: ReplayBuffer() for agent in env.agents}
         
-        done = False
-        step = 0
-        
-        while not done and step < max_steps:
-            # 为每个智能体选择动作
-            actions = {}
-            
-            for agent_name in env.agents:
-                pi, *_ = agents[agent_name]
-                obs = torch.tensor(observations[agent_name], dtype=torch.float32).unsqueeze(0).to(device)
-                
-                # 如果经验足够则使用策略，否则随机探索
-                if memory[agent_name].size() > start_training:
-                    with torch.no_grad():
-                        action, _ = pi(obs)
-                        action = action.squeeze().cpu().detach().numpy()
-                else:
-                    action = np.random.uniform(0, 1, size=act_dim)
-                
-                actions[agent_name] = action
-            
-            # 执行动作
-            next_observations, rewards, terminations, truncations, infos = env.step(actions)
-            
-            # 判断是否结束
-            done = all(terminations.values()) or all(truncations.values())
-            
-            # 存储经验
-            for agent_name in env.agents:
-                memory[agent_name].put((
-                    observations[agent_name],
-                    actions[agent_name],
-                    rewards[agent_name] * reward_scale,  # 应用奖励缩放
-                    next_observations[agent_name],
-                    done
-                ))
-                
-                # 累计奖励
-                episode_score[agent_name] += rewards[agent_name]
-            
-            # 更新观测
-            observations = next_observations
-            
-            # 训练智能体 - 改为按照环境步数和梯度步数比例来更新
-            if memory[agent_name].size() > start_training:
-                if total_step % train_interval == 0:
-                    for _ in range(num_gradients_per_step):
-                        for agent_name in env.agents:
-                            pi, q1, q2, q1_target, q2_target = agents[agent_name]
-                            
-                            for _ in range(update_iterations):
-                                mini_batch = memory[agent_name].sample(batch_size)
-                                
-                                # 更新Q网络
-                                td_target = calc_target(pi, q1_target, q2_target, mini_batch)
-                                q1.train_net(td_target, mini_batch)
-                                q2.train_net(td_target, mini_batch)
-                                
-                                # 更新策略网络
-                                pi.train_net(q1, q2, mini_batch)
-                                
-                                # 软更新目标网络
-                                q1.soft_update(q1_target)
-                                q2.soft_update(q2_target)
-                                
-                                gradient_steps += 1
-            
-            total_step += 1
-            step += 1
-        
-        # 回合结束，记录成功率
+        # 为每个智能体创建SAC模型
+        agents = {}
         for agent_name in env.agents:
-            if agent_name in infos and "is_success" in infos[agent_name] and infos[agent_name]["is_success"]:
-                episode_success[agent_name] = 1
-            else:
-                episode_success[agent_name] = 0
+            pi = PolicyNet(obs_dim, act_dim, act_bound).to(device)
+            q1, q2 = QNet(obs_dim, act_dim).to(device), QNet(obs_dim, act_dim).to(device)
+            q1_target, q2_target = QNet(obs_dim, act_dim).to(device), QNet(obs_dim, act_dim).to(device)
             
-            scores[agent_name].append(episode_score[agent_name])
-            success_rates[agent_name].append(episode_success[agent_name])
+            # 初始化目标网络
+            q1_target.load_state_dict(q1.state_dict())
+            q2_target.load_state_dict(q2.state_dict())
+            
+            agents[agent_name] = (pi, q1, q2, q1_target, q2_target)
         
-        # 打印训练进度
-        if n_epi % print_interval == 0:
-            for agent_name in env.agents:
-                pi, *_ = agents[agent_name]
-                avg_score = np.mean(scores[agent_name][-print_interval:])
-                avg_success = np.mean(success_rates[agent_name][-print_interval:])
+        # 统计指标
+        scores = {agent: [] for agent in env.agents}
+        success_rates = {agent: [] for agent in env.agents}
+        episode_score = {agent: 0 for agent in env.agents}
+        episode_success = {agent: 0 for agent in env.agents}
+        
+        total_step = 0
+        gradient_steps = 0
+        
+        for n_epi in range(1, max_episodes+1):
+            observations, infos = env.reset()
+            
+            # 重置每个回合的统计
+            for agent in env.agents:
+                episode_score[agent] = 0
+            
+            done = False
+            step = 0
+            
+            while not done and step < max_steps:
+                # 为每个智能体选择动作
+                actions = {}
                 
-                print(f"Episode {n_epi}, {agent_name}: Avg Score: {avg_score:.2f}, "
-                      f"Success Rate: {avg_success:.2f}, Alpha: {pi.log_alpha.exp().item():.4f}, "
-                      f"Gradient Steps: {gradient_steps}")
-        
-        # 保存模型
-        if n_epi % save_interval == 0:
-            for agent_name in env.agents:
-                save_models(agents[agent_name], agent_name, n_epi)
+                for agent_name in env.agents:
+                    pi, *_ = agents[agent_name]
+                    obs = torch.tensor(observations[agent_name], dtype=torch.float32).unsqueeze(0).to(device)
+                    
+                    # 如果经验足够则使用策略，否则随机探索
+                    if memory[agent_name].size() > start_training:
+                        with torch.no_grad():
+                            action, _ = pi(obs)
+                            action = action.squeeze().cpu().detach().numpy()
+                    else:
+                        action = np.random.uniform(0, 1, size=act_dim)
+                    
+                    actions[agent_name] = action
+                
+                # 执行动作
+                next_observations, rewards, terminations, truncations, infos = env.step(actions)
+                
+                # 判断是否结束
+                done = all(terminations.values()) or all(truncations.values())
+                
+                # 存储经验
+                for agent_name in env.agents:
+                    memory[agent_name].put((
+                        observations[agent_name],
+                        actions[agent_name],
+                        rewards[agent_name] * reward_scale,  # 应用奖励缩放
+                        next_observations[agent_name],
+                        done
+                    ))
+                    
+                    # 累计奖励
+                    episode_score[agent_name] += rewards[agent_name]
+                
+                # 更新观测
+                observations = next_observations
+                
+                # 训练智能体 - 改为按照环境步数和梯度步数比例来更新
+                if memory[agent_name].size() > start_training:
+                    if total_step % train_interval == 0:
+                        for _ in range(num_gradients_per_step):
+                            for agent_name in env.agents:
+                                pi, q1, q2, q1_target, q2_target = agents[agent_name]
+                                
+                                for _ in range(update_iterations):
+                                    mini_batch = memory[agent_name].sample(batch_size)
+                                    
+                                    # 更新Q网络
+                                    td_target = calc_target(pi, q1_target, q2_target, mini_batch)
+                                    q1.train_net(td_target, mini_batch)
+                                    q2.train_net(td_target, mini_batch)
+                                    
+                                    # 更新策略网络
+                                    pi.train_net(q1, q2, mini_batch)
+                                    
+                                    # 软更新目标网络
+                                    q1.soft_update(q1_target)
+                                    q2.soft_update(q2_target)
+                                    
+                                    gradient_steps += 1
+                
+                total_step += 1
+                step += 1
             
-            # 保存训练进度信息
-            progress_file = f"{model_path}/training_progress_{args.world_name}.npy"
-            np.save(progress_file, {
-                'episode': n_epi,
-                'scores': scores,
-                'success_rates': success_rates
-            })
+            # 回合结束，记录成功率
+            for agent_name in env.agents:
+                if agent_name in infos and "is_success" in infos[agent_name] and infos[agent_name]["is_success"]:
+                    episode_success[agent_name] = 1
+                else:
+                    episode_success[agent_name] = 0
+                
+                scores[agent_name].append(episode_score[agent_name])
+                success_rates[agent_name].append(episode_success[agent_name])
+            
+            # 打印训练进度
+            if n_epi % print_interval == 0:
+                for agent_name in env.agents:
+                    pi, *_ = agents[agent_name]
+                    avg_score = np.mean(scores[agent_name][-print_interval:])
+                    avg_success = np.mean(success_rates[agent_name][-print_interval:])
+                    
+                    print(f"Episode {n_epi}, {agent_name}: Avg Score: {avg_score:.2f}, "
+                        f"Success Rate: {avg_success:.2f}, Alpha: {pi.log_alpha.exp().item():.4f}, "
+                        f"Gradient Steps: {gradient_steps}")
+            
+            # 保存模型
+            if n_epi % save_interval == 0:
+                for agent_name in env.agents:
+                    save_models(agents[agent_name], agent_name, n_epi)
+                
+                # 保存训练进度信息
+                progress_file = f"{model_path}/training_progress_{args.world_name}.npy"
+                np.save(progress_file, {
+                    'episode': n_epi,
+                    'scores': scores,
+                    'success_rates': success_rates
+                })
+        
+        # 训练结束，绘制结果图表
+        if args.plot_results:
+            plot_file = f"{model_path}/training_results_{args.world_name}.png"
+            plot_training_results(scores, success_rates, save_path=plot_file)
+        
+    else:
+        # 评估模式：加载已有模型并评估
+        print(f"Evaluation mode: Loading models from episode {args.load_episode}")
+        
+        # 加载训练好的模型
+        agents = {}
+        for agent_name in env.agents:
+            pi, q1, q2, q1_target, q2_target = load_models(
+                agent_name, args.load_episode, obs_dim, act_dim, act_bound
+            )
+            agents[agent_name] = (pi, q1, q2, q1_target, q2_target)
+        
+        # 执行评估
+        avg_rewards, success_rates = evaluate_policy(
+            env, agents, 
+            num_episodes=args.eval_episodes, 
+            max_steps=max_steps, 
+            render=args.render
+        )
+        
+        # 打印评估结果
+        print("\n=== Evaluation Results ===")
+        for agent_name in env.agents:
+            print(f"{agent_name}: Avg Reward: {avg_rewards[agent_name]:.2f}, "
+                  f"Success Rate: {success_rates[agent_name]:.2f}")
+        print("=========================\n")
     
     # 关闭环境
     env.close()
-    
-    # 在训练结束后绘制结果图表
-    if args.plot_results:
-        plot_file = f"{model_path}/training_results_{args.world_name}.png"
-        plot_training_results(scores, success_rates, save_path=plot_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-agent SAC training for dual evade environment")
+    
+    parser.add_argument("--mode", type=str, choices=['train', 'eval'], default='train',
+                        help="Mode: 'train' for training, 'eval' for evaluation")
+    parser.add_argument("--load_episode", type=int, default=1000,
+                        help="Which episode to load model from for evaluation")
+    parser.add_argument("--eval_episodes", type=int, default=50,
+                        help="Number of episodes to run for evaluation")
     
     parser.add_argument("--world_name", type=str, default="21_05", help="World configuration")
     parser.add_argument("--use_lppos", action="store_true", help="Use limited action list")
