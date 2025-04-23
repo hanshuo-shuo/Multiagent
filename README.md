@@ -26,3 +26,9 @@ python train_dqn.py --epoch 30 --step-per-epoch 2000 --test-num 1 --batch-size 2
 - Custom reward functions
 - Parallel environment support for multi-agent training
 - TensorBoard logging for tracking training progress
+
+
+# SAC 马太效应 and DQN 
+They don't see each other: 
+
+![image](https://github.com/user-attachments/assets/f1fee172-2dc4-470c-a0e2-db422cdfeb09)
