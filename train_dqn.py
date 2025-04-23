@@ -1,804 +1,672 @@
+import collections
+import random
+import os
+from datetime import datetime
+import numpy as np
+from env import DualEvadeEnv
+from reward import custom_reward
 import torch
 import torch.nn as nn
-import numpy as np
-import time
-import argparse
-import os
+import torch.nn.functional as F
+import torch.optim as optim
+import gymnasium as gym
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
 from pz_env import env as make_env
-from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.data import Batch, VectorReplayBuffer
-from tianshou.env import DummyVectorEnv
-from tianshou.policy import DQNPolicy
-from tianshou.utils.net.common import Net
-from env import DualEvadeEnv
+# Optimized Hyperparameters
+learning_rate = 0.0001  # Optimized learning rate
+gamma = 0.99  # Higher discount factor for better long-term planning
+buffer_limit = 200000  # Larger replay buffer
+batch_size = 256  # Larger batch size for more stable gradients
+log_interval = 10  # More frequent logging
+max_episodes = 1000
+min_buffer_size = 1000  # Minimum buffer size before training starts
+soft_update_tau = 0.005  # For soft updates instead of hard updates
 
+# Exploration parameters
+initial_epsilon = 1
+final_epsilon = 0.01
+epsilon_decay = 0.99  # Exponential decay
 
-import math
+# Environment parameters
+max_steps = 300
+render = False  # Set to True to visualize training
 
-def custom_reward(obs):
+# Early stopping parameters
+patience = 50  # Number of episodes to wait for improvement
+min_improvement = 0.01  # Minimum improvement to reset patience counter
+
+# Network structure parameters
+hidden_size = 256  # Larger hidden size
+num_layers = 3  # More layers for a deeper network
+
+class ReplayBuffer:
+    def __init__(self):
+        self.buffer = collections.deque(maxlen=buffer_limit)
+    
+    def put(self, transition):
+        self.buffer.append(transition)
+    
+    def sample(self, n):
+        mini_batch = random.sample(self.buffer, n)
+        s_lst, a_lst, r_lst, s_prime_lst, done_mask_lst = [], [], [], [], []
+        
+        for transition in mini_batch:
+            s, a, r, s_prime, done_mask = transition
+            s_lst.append(s)
+            a_lst.append([a])
+            r_lst.append([r])
+            s_prime_lst.append(s_prime)
+            done_mask_lst.append([done_mask])
+        
+        # 使用numpy.array转换列表为数组，避免性能警告
+        s_array = np.array(s_lst, dtype=np.float32)
+        a_array = np.array(a_lst)
+        r_array = np.array(r_lst)
+        s_prime_array = np.array(s_prime_lst, dtype=np.float32)
+        done_mask_array = np.array(done_mask_lst)
+
+        return torch.tensor(s_array, dtype=torch.float), torch.tensor(a_array), \
+               torch.tensor(r_array), torch.tensor(s_prime_array, dtype=torch.float), \
+               torch.tensor(done_mask_array)
+    
+    def size(self):
+        return len(self.buffer)
+
+class DuelingQnet(nn.Module):
     """
-    obs.self_x, obs.self_y           -- agent 的当前坐标
-    obs.predator_x, obs.predator_y   -- 捕食者坐标（为 0 时表示不可见）
+    Improved Dueling DQN architecture with:
+    - More layers
+    - Larger hidden layers
+    - Dueling Q-network structure
+    - Layer Normalization
     """
-    reward = 0.0
-    # 自身坐标
-    x, y = obs.self_x, obs.self_y
+    def __init__(self, obs_dim, action_dim):
+        super(DuelingQnet, self).__init__()
+        # Feature extraction layers
+        self.layers = nn.Sequential(
+            nn.Linear(obs_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+        )
+        
+        # Value stream
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        # Advantage stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, action_dim)
+        )
+        
+    def forward(self, x):
+        features = self.layers(x)
+        
+        value = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+        
+        # 修复维度问题：如果输入是单个样本，则没有批次维度
+        if advantages.dim() == 1:
+            # 单样本情况下，直接使用所有动作的平均值
+            return value + (advantages - advantages.mean())
+        else:
+            # 批量样本情况下，对每个样本的动作进行平均
+            return value + (advantages - advantages.mean(dim=1, keepdim=True))
+      
+    def sample_action(self, obs, epsilon):
+        # Convert numpy array to tensor if needed
+        if isinstance(obs, np.ndarray):
+            obs = torch.tensor(obs, dtype=torch.float)
+        
+        # 确保输入有正确的维度
+        if obs.dim() == 1:
+            # 如果是单个样本，添加批次维度
+            obs = obs.unsqueeze(0)
+        
+        # Use epsilon-greedy policy for exploration
+        if random.random() < epsilon:
+            return random.randint(0, self.advantage_stream[-1].out_features - 1)
+        else:
+            with torch.no_grad():
+                # 确保正确获取argmax并返回标量
+                return self.forward(obs).squeeze(0).argmax().item()
 
-    # 捕食惩罚：只有 predator 坐标非 0 时才判断距离
-    if obs.predator_x != 0 or obs.predator_y != 0:
-        d_pred = math.hypot(x - obs.predator_x, y - obs.predator_y)
-        if d_pred < 0.1:
-            reward -= 1.0
+def train(q, q_target, memory, optimizer):
+    if memory.size() < batch_size:
+        return 0  # Not enough samples
+    
+    total_loss = 0
+    # Perform multiple training steps
+    for _ in range(10):  # Increased number of training iterations per episode
+        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+        
+        # 确保所有张量都在正确的设备上
+        device = next(q.parameters()).device
+        s = s.to(device)
+        a = a.to(device)
+        r = r.to(device)
+        s_prime = s_prime.to(device)
+        done_mask = done_mask.to(device)
 
-    # 成功奖励：到达 (1.0, 0.5) 半径 0.1 内
-    d_goal = math.hypot(x - 1.0, y - 0.5)
-    if d_goal < 0.1:
-        reward += 1.0
+        # Get current Q values
+        q_out = q(s)
+        q_a = q_out.gather(1, a)
+        
+        # Double DQN: use online network to select action, target network to evaluate
+        with torch.no_grad():
+            next_q_values = q(s_prime)
+            best_actions = next_q_values.argmax(1, keepdim=True)
+            next_q_target_values = q_target(s_prime)
+            max_q_prime = next_q_target_values.gather(1, best_actions)
+            
+            # Calculate target Q values
+            target = r + gamma * max_q_prime * done_mask
+        
+        # Huber loss for stability
+        loss = F.smooth_l1_loss(q_a, target)
+        total_loss += loss.item()
+        
+        # Optimization step
+        optimizer.zero_grad()
+        loss.backward()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(q.parameters(), max_norm=10)
+        optimizer.step()
+    
+    return total_loss / 8  # Return average loss
 
-    return reward
+def soft_update(target, source, tau):
+    """
+    Soft update model parameters.
+    θ_target = τ*θ_source + (1 - τ)*θ_target
+    """
+    for target_param, source_param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(
+            target_param.data * (1.0 - tau) + source_param.data * tau
+        )
 
-# 设置随机种子
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def plot_rewards(rewards_history, log_dir, window=100):
+    """
+    Plot the reward curves for all agents
+    """
+    plt.figure(figsize=(12, 8))
+    
+    has_data_to_plot = False
+    for agent_name, rewards in rewards_history.items():
+        # Calculate moving average with specified window
+        if len(rewards) >= window:
+            moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
+            x = range(window-1, len(rewards))
+            plt.plot(x, moving_avg, label=f"{agent_name} ({len(rewards)} episodes)")
+            has_data_to_plot = True
+        elif len(rewards) > 0:
+            plt.plot(rewards, label=f"{agent_name} ({len(rewards)} episodes)")
+            has_data_to_plot = True
+    
+    plt.title("Training Rewards Moving Average")
+    plt.xlabel("Episodes")
+    plt.ylabel("Reward")
+    
+    # 只有当有数据绘制时才添加legend
+    if has_data_to_plot:
+        plt.legend()
+    
+    plt.grid(True)
+    
+    # Save the plot
+    plt.savefig(os.path.join(log_dir, "reward_curves.png"))
+    plt.close()
+
+def main():
+    # Create log directory
+    current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = os.path.join('log', f'dqn_multiagent_{current_time}')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Setup device - use GPU if available
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+        device = torch.device("cuda")
+        print("Using GPU for training")
     else:
+        device = torch.device("cpu")
         print("GPU is not available, using CPU instead")
-
-# 定义直接的PettingZoo Parallel环境封装
-class ParallelPettingZooEnv:
-    """封装PettingZoo的Parallel环境"""
     
-    def __init__(self, env):
-        self.env = env
-        # 设置当前智能体、观测和动作空间
-        self.agents = self.env.agents
-        self.agent_ids = {agent: i for i, agent in enumerate(self.agents)}
-        
-        # 缓存当前智能体的观测和信息
-        self.observations = None
-        self.infos = None
-        
-        # 获取观测空间和动作空间
-        self.observation_spaces = self.env.observation_spaces
-        self.action_spaces = self.env.action_spaces
-    
-    def reset(self, seed=None):
-        """重置环境并返回所有智能体的观测"""
-        self.observations, self.infos = self.env.reset(seed=seed)
-        return self.observations, self.infos
-    
-    def step(self, actions):
-        """并行执行所有智能体的动作"""
-        # 转换动作为字典格式，如果不是
-        if not isinstance(actions, dict):
-            action_dict = {agent: actions[i] for i, agent in enumerate(self.agents)}
-        else:
-            action_dict = actions
-            
-        # 执行环境步
-        self.observations, rewards, terminations, truncations, self.infos = self.env.step(action_dict)
-        
-        # 检查是否所有智能体都终止
-        done = all(terminations.values()) or all(truncations.values())
-        
-        return self.observations, rewards, terminations, truncations, self.infos, done
-    
-    def render(self):
-        """渲染环境"""
-        return self.env.render()
-    
-    def close(self):
-        """关闭环境"""
-        self.env.close()
-
-# 创建环境
-def make_env_fn(world="21_05", use_pred=True, render=False):
-    def _make_env():
-        # 创建基础环境
-        raw_env = make_env(
-            world_name=world,
-            use_lppos=True,
-            use_predator=use_pred,
-            max_step=300,
-            reward_function=custom_reward,
-            time_step=0.25,
-            render=render,
-            real_time=render,
-            end_on_pov_goal=False,  # 要求两个智能体都达到目标才结束
-            use_other=True,
-            action_type=DualEvadeEnv.ActionType.DISCRETE  # 对DQN使用离散动作空间
-        )
-        # 直接使用Parallel环境，不转换为AEC
-        return ParallelPettingZooEnv(raw_env)
-    return _make_env
-
-# 为DQN创建离散网络
-def make_dqn_net(state_dim, action_dim, device, hidden_sizes=[256, 256]):
-    net = Net(
-        state_shape=state_dim,
-        action_shape=action_dim,
-        hidden_sizes=hidden_sizes,
-        activation=nn.ReLU,
-        device=device
-    )
-    return net
-
-# 创建DQN策略
-def make_dqn_policy(net, action_space, device='cpu', lr=3e-4, gamma=0.99, 
-                    estimation_step=3, target_update_freq=100):
-    # 优化器
-    optim = torch.optim.Adam(net.parameters(), lr=lr)
-    
-    # 创建DQN策略
-    policy = DQNPolicy(
-        model=net,
-        optim=optim,
-        discount_factor=gamma,
-        estimation_step=estimation_step,
-        target_update_freq=target_update_freq,
-        action_space=action_space,
-        # 额外参数
-        reward_normalization=False,
-        is_double=True  # 使用Double DQN
+    # Create environment
+    env = make_env(
+        world_name="21_05",
+        use_lppos=True,
+        use_predator=True,
+        max_step=300,
+        reward_function=custom_reward,
+        time_step=0.25,
+        render=render,
+        real_time=render,  # Only use real-time when rendering
+        end_on_pov_goal=False,
+        use_other=True,
+        action_type=DualEvadeEnv.ActionType.DISCRETE
     )
     
-    return policy
-
-def calculate_returns(rewards, gamma, dones, next_values=None, n_step=1):
-    """
-    计算n步回报，按照 Tianshou 的实现方式
+    # Get observation and action dimensions for the first reset
+    observations, _ = env.reset()
     
-    Args:
-        rewards: 单个步骤的奖励列表
-        gamma: 折扣因子
-        dones: 是否终止的布尔列表
-        next_values: 下一个状态的价值估计，用于bootstrapping
-        n_step: 计算几步返回值
-        
-    Returns:
-        returns: 计算出的回报值
-    """
-    returns = np.zeros_like(rewards)
-    
-    # 处理单步情况
-    if len(rewards) == 1:
-        if dones[0]:
-            # 如果是终止状态，则只有即时奖励
-            return rewards
-        else:
-            # 如果非终止状态，且提供了下一状态的价值，则使用TD目标
-            if next_values is not None:
-                return rewards + gamma * (1 - dones) * next_values
-            return rewards
-    
-    # 多步情况
-    T = len(rewards)
-    for i in range(T):
-        if dones[i]:
-            # 如果当前状态是终止状态，则只用即时奖励
-            returns[i] = rewards[i]
-            continue
-            
-        # 计算n步回报
-        n_actual = min(n_step, T - i)
-        ret = 0
-        for j in range(n_actual):
-            # 累加未来n步的折扣奖励
-            if i + j < T:
-                ret += (gamma ** j) * rewards[i + j]
-                # 如果碰到终止状态，则停止累加
-                if i + j < T and dones[i + j]:
-                    break
-        
-        # 如果没到终止状态并且还能继续往后看，则加上bootstrapping项
-        if i + n_actual < T and not dones[i + n_actual - 1]:
-            if next_values is not None and i + n_actual < len(next_values):
-                # 使用给定的下一状态价值估计进行bootstrapping
-                ret += (gamma ** n_actual) * next_values[i + n_actual]
-                
-        returns[i] = ret
-        
-    return returns
-
-def train_dqn_agents(args):
-    """并行训练多个DQN智能体"""
-    # 设置随机种子
-    set_seed(args.seed)
-    
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    
-    # 创建环境
-    use_predator = not getattr(args, 'no_predator', False)
-    env = make_env_fn(world="21_05", use_pred=use_predator, render=False)()
-    print(f"创建环境成功，智能体列表: {env.agents}")
-    
-    # 获取观测和动作空间
-    obs_dict, _ = env.reset(seed=args.seed)
-    
-    # 为每个智能体创建策略
+    # Create agents (one per prey)
     agents = {}
-    buffers = {}
+    rewards_history = {}  # Store rewards for plotting
+    best_rewards = {}  # Track best rewards for early stopping
+    patience_counter = {}  # Track patience for early stopping
     
-    for agent_id in env.agents:
-        print(f"\n开始为智能体 {agent_id} 设置训练...")
-        # 获取观测维度和动作维度
-        obs_shape = len(obs_dict[agent_id])
-        action_dim = env.action_spaces[agent_id].n
-        print(f"观测维度: {obs_shape}, 动作空间: {action_dim}")
+    for agent_name in env.possible_agents:
+        obs_dim = env.observation_spaces[agent_name].shape[0]
         
-        # 创建网络
-        net = make_dqn_net(
-            state_dim=obs_shape, 
-            action_dim=action_dim,
-            device=device,
-            hidden_sizes=args.hidden_sizes
-        )
+        if isinstance(env.action_spaces[agent_name], gym.spaces.Discrete):
+            act_dim = env.action_spaces[agent_name].n
+        else:
+            raise ValueError("This implementation only supports discrete action spaces")
         
-        # 创建DQN策略
-        policy = DQNPolicy(
-            model=net,
-            optim=torch.optim.Adam(net.parameters(), lr=args.lr),
-            discount_factor=args.gamma,
-            estimation_step=args.n_step,
-            target_update_freq=args.target_update_freq,
-            action_space=env.action_spaces[agent_id],
-            is_double=True  # 使用Double DQN
-        )
+        # Create Q-networks and target networks with improved architecture
+        q_net = DuelingQnet(obs_dim, act_dim).to(device)
+        q_target = DuelingQnet(obs_dim, act_dim).to(device)
+        q_target.load_state_dict(q_net.state_dict())
         
-        agents[agent_id] = policy
+        # Create optimizer with learning rate scheduler
+        optimizer = optim.Adam(q_net.parameters(), lr=learning_rate)
+        memory = ReplayBuffer()
         
-        # 创建每个智能体的回放缓冲区
-        buffers[agent_id] = VectorReplayBuffer(
-            total_size=args.buffer_size,
-            buffer_num=1  # 单个环境实例
-        )
+        agents[agent_name] = {
+            "q_net": q_net,
+            "q_target": q_target,
+            "optimizer": optimizer,
+            "memory": memory,
+            "score": 0.0,
+            "obs_dim": obs_dim,
+            "act_dim": act_dim,
+            "training_losses": []  # Track losses
+        }
+        
+        rewards_history[agent_name] = []
+        best_rewards[agent_name] = -float('inf')
+        patience_counter[agent_name] = 0
     
-    # 创建日志记录器
-    log_path = os.path.join(args.logdir, 'dqn', f"{int(time.time())}")
-    os.makedirs(log_path, exist_ok=True)
-    writer = SummaryWriter(log_path)
+    # Log all hyperparameters
+    with open(os.path.join(log_dir, "parameters.txt"), "w") as f:
+        f.write(f"learning_rate: {learning_rate}\n")
+        f.write(f"gamma: {gamma}\n")
+        f.write(f"buffer_limit: {buffer_limit}\n")
+        f.write(f"batch_size: {batch_size}\n")
+        f.write(f"hidden_size: {hidden_size}\n")
+        f.write(f"num_layers: {num_layers}\n")
+        f.write(f"soft_update_tau: {soft_update_tau}\n")
+        f.write(f"initial_epsilon: {initial_epsilon}\n")
+        f.write(f"final_epsilon: {final_epsilon}\n")
+        f.write(f"epsilon_decay: {epsilon_decay}\n")
     
-    # 训练循环
-    print("\n开始训练...")
-    total_steps = 0  # 记录总步数，用于计算epsilon
+    # Create progress bar
+    pbar = tqdm(range(max_episodes), desc="Training")
     
-    for epoch in range(args.epoch):
-        print(f"\n开始Epoch {epoch+1}/{args.epoch}")
+    # Initialize epsilon
+    epsilon = initial_epsilon
+    
+    # Training loop
+    for episode in pbar:
+        # Reset environment
+        observations, _ = env.reset()
         
-        # 设置训练模式
-        for agent_id, policy in agents.items():
-            policy.train()
+        # Episode loop
+        done = False
+        episode_rewards = {agent: 0.0 for agent in env.agents}
         
-        # 每个智能体的累积回报
-        epoch_returns = {agent_id: [] for agent_id in env.agents}
-        
-        # 先收集预训练数据，填充经验回放缓冲区
-        if epoch == 0:
-            print("收集初始数据...")
-            # 重置环境
-            obs_dict, _ = env.reset(seed=args.seed + epoch)
-            # 收集一些步骤来填充缓冲区
-            for i in range(args.batch_size * 2):
-                # 为每个智能体选择动作
-                actions = {}
-                for agent_id, policy in agents.items():
-                    # 计算当前的探索率 - 线性衰减
-                    current_eps = max(args.eps_min, args.eps_start - 
-                                   (args.eps_start - args.eps_min) * min(1.0, total_steps / args.eps_decay_steps))
-                    
-                    # 设置当前的探索率
-                    policy.set_eps(current_eps)
-                    
-                    # 转换观测为tensor
-                    obs_tensor = torch.tensor(
-                        obs_dict[agent_id], 
-                        dtype=torch.float32, 
-                        device=device
-                    ).unsqueeze(0)
-                    
-                    # 选择动作
-                    result = policy(Batch(obs=obs_tensor, info={}))
-                    # 确保动作是int类型
-                    if torch.is_tensor(result.act):
-                        actions[agent_id] = result.act.item()
-                    else:
-                        actions[agent_id] = int(result.act)
-                
-                # 执行动作
-                next_obs_dict, rewards, terminations, truncations, infos, done = env.step(actions)
-                total_steps += 1
-                
-                # 为每个智能体存储经验
-                for agent_id in env.agents:
-                    # 计算n步return 
-                    rew = rewards[agent_id]
-                    done_flag = terminations[agent_id] or truncations[agent_id]
-                    
-                    # 对单个步骤，正确的TD目标是即时奖励加上折扣的下一状态价值
-                    # 由于目前我们没有下一状态的价值，这里只能暂时使用即时奖励
-                    # 完整的TD目标在训练循环中的batch更新部分计算
-                    return_value = calculate_returns(
-                        np.array([rew]), 
-                        args.gamma, 
-                        np.array([done_flag]), 
-                        n_step=1
-                    )[0]
-                    
-                    # 创建经验
-                    experience = Batch(
-                        obs=np.array([obs_dict[agent_id]], dtype=np.float32),
-                        act=np.array([actions[agent_id]], dtype=np.int64),
-                        rew=np.array([rew], dtype=np.float32),
-                        terminated=np.array([terminations[agent_id]], dtype=np.bool_),
-                        truncated=np.array([truncations[agent_id]], dtype=np.bool_),
-                        done=np.array([done_flag], dtype=np.bool_),
-                        obs_next=np.array([next_obs_dict[agent_id]], dtype=np.float32),
-                        info=np.array([{}]),
-                        # 使用计算好的return值
-                        returns=np.array([return_value], dtype=np.float32)
-                    )
-                    
-                    # 添加到缓冲区
-                    buffers[agent_id].add(experience)
-                
-                # 更新观测
-                obs_dict = next_obs_dict
-                
-                # 如果回合结束，重置环境
-                if done:
-                    obs_dict, _ = env.reset(seed=args.seed + epoch + i)
-        
-        # 收集数据和训练
-        episode_returns = {agent_id: 0.0 for agent_id in env.agents}
-        episode_steps = 0
-        
-        obs_dict, _ = env.reset(seed=args.seed + epoch * 100)
-        
-        for i in range(args.step_per_epoch):
-            # 选择动作
+        while not done:
+            # Each agent selects action based on current observation
             actions = {}
-            for agent_id, policy in agents.items():
-                # 计算当前的探索率 - 线性衰减
-                current_eps = max(args.eps_min, args.eps_start - 
-                               (args.eps_start - args.eps_min) * min(1.0, total_steps / args.eps_decay_steps))
+            for agent_name in env.agents:
+                obs = observations[agent_name]
+                # Move observation to device
+                obs_tensor = torch.tensor(obs, dtype=torch.float).to(device)
+                action = agents[agent_name]["q_net"].sample_action(obs_tensor, epsilon)
+                actions[agent_name] = action
+            
+            # Execute actions in environment
+            next_observations, rewards, terminations, truncations, infos = env.step(actions)
+            
+            # Store transitions in replay buffers and update observations
+            for agent_name in env.agents:
+                obs = observations[agent_name]
+                action = actions[agent_name]
+                reward = rewards[agent_name]
+                next_obs = next_observations[agent_name]
                 
-                if i % 100 == 0:  # 每100步打印一次当前探索率
-                    print(f"当前步数: {total_steps}, 探索率 (epsilon): {current_eps:.4f}")
+                # Check if episode is done for this agent
+                terminated = terminations[agent_name]
+                truncated = truncations[agent_name]
+                done_mask = 0.0 if (terminated or truncated) else 1.0
                 
-                # 设置当前的探索率
-                policy.set_eps(current_eps)
+                # Store transition
+                agents[agent_name]["memory"].put((obs, action, reward, next_obs, done_mask))
                 
-                # 转换观测为tensor
-                obs_tensor = torch.tensor(
-                    obs_dict[agent_id], 
-                    dtype=torch.float32, 
-                    device=device
-                ).unsqueeze(0)
+                # Update agent score
+                agents[agent_name]["score"] += reward
+                episode_rewards[agent_name] += reward
+            
+            # Update observations
+            observations = next_observations
+            
+            # Check if episode is done
+            done = all(terminations.values()) or all(truncations.values())
+        
+        # Decay epsilon
+        epsilon = max(final_epsilon, epsilon * epsilon_decay)
+        
+        # Train agents if enough samples are collected
+        for agent_name in env.agents:
+            agent = agents[agent_name]
+            
+            # Append episode reward to history
+            rewards_history[agent_name].append(episode_rewards[agent_name])
+            
+            # Check if there's enough data to start training
+            if agent["memory"].size() > min_buffer_size:
+                avg_loss = train(agent["q_net"], agent["q_target"], agent["memory"], agent["optimizer"])
+                agent["training_losses"].append(avg_loss)
+            
+                # Soft update target network
+                soft_update(agent["q_target"], agent["q_net"], soft_update_tau)
+        
+        # Log training progress
+        if episode % log_interval == 0:
+            log_msg = f"Episode: {episode:5d} | Epsilon: {epsilon:.3f}"
+            for agent_name in env.agents:
+                # Update win rate over the last 100 episodes
+                recent_rewards = rewards_history[agent_name][-100:]
+                avg_reward = np.mean(recent_rewards) if recent_rewards else 0
                 
-                # 选择动作
-                result = policy(Batch(obs=obs_tensor, info={}))
-                # 确保动作是int类型
-                if torch.is_tensor(result.act):
-                    actions[agent_id] = result.act.item()
+                # Update progress bar
+                log_msg += f" | {agent_name} - AvgR: {avg_reward:.3f}"
+                
+                # Early stopping check
+                if avg_reward > best_rewards[agent_name] + min_improvement:
+                    best_rewards[agent_name] = avg_reward
+                    patience_counter[agent_name] = 0
+                    
+                    # Save best model
+                    best_model_path = os.path.join(log_dir, f"{agent_name}_best.pt")
+                    torch.save(agents[agent_name]["q_net"].state_dict(), best_model_path)
                 else:
-                    actions[agent_id] = int(result.act)
+                    patience_counter[agent_name] += 1
             
-            # 执行动作
-            next_obs_dict, rewards, terminations, truncations, infos, done = env.step(actions)
-            total_steps += 1
+            # Update progress bar
+            pbar.set_postfix_str(log_msg)
             
-            # 更新累积奖励
-            for agent_id in env.agents:
-                episode_returns[agent_id] += rewards[agent_id]
-            
-            episode_steps += 1
-            
-            # 为每个智能体存储经验
-            for agent_id in env.agents:
-                # 计算n步return
-                rew = rewards[agent_id]
-                done_flag = terminations[agent_id] or truncations[agent_id]
+            # Plot and save reward curves periodically
+            if episode % (log_interval * 10) == 0:
+                plot_rewards(rewards_history, log_dir)
                 
-                # 对单个步骤，正确的TD目标是即时奖励加上折扣的下一状态价值
-                # 由于目前我们没有下一状态的价值，这里只能暂时使用即时奖励
-                # 完整的TD目标在训练循环中的batch更新部分计算
-                return_value = calculate_returns(
-                    np.array([rew]), 
-                    args.gamma, 
-                    np.array([done_flag]), 
-                    n_step=1
-                )[0]
+                # Save loss curves
+                plt.figure(figsize=(12, 8))
+                has_loss_to_plot = False
+                for agent_name in env.agents:
+                    losses = agents[agent_name]["training_losses"]
+                    if losses:
+                        # Smooth losses for better visualization
+                        window_size = min(50, len(losses) // 10 + 1)
+                        smoothed_losses = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
+                        plt.plot(smoothed_losses, label=f"{agent_name} Loss")
+                        has_loss_to_plot = True
                 
-                # 创建经验
-                experience = Batch(
-                    obs=np.array([obs_dict[agent_id]], dtype=np.float32),
-                    act=np.array([actions[agent_id]], dtype=np.int64),
-                    rew=np.array([rew], dtype=np.float32),
-                    terminated=np.array([terminations[agent_id]], dtype=np.bool_),
-                    truncated=np.array([truncations[agent_id]], dtype=np.bool_),
-                    done=np.array([done_flag], dtype=np.bool_),
-                    obs_next=np.array([next_obs_dict[agent_id]], dtype=np.float32),
-                    info=np.array([{}]),
-                    # 使用计算好的return值
-                    returns=np.array([return_value], dtype=np.float32)
-                )
-                
-                # 添加到缓冲区
-                buffers[agent_id].add(experience)
+                plt.title("Training Loss")
+                plt.xlabel("Training Steps")
+                plt.ylabel("Loss")
+                if has_loss_to_plot:
+                    plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(log_dir, "loss_curves.png"))
+                plt.close()
             
-            # 更新观测
-            obs_dict = next_obs_dict
+            # Check early stopping
+            should_stop = True
+            for agent_name in env.agents:
+                if patience_counter[agent_name] < patience:
+                    should_stop = False
+                    break
             
-            # 如果回合结束，记录回报并重置环境
-            if done or episode_steps >= 300:
-                for agent_id in env.agents:
-                    epoch_returns[agent_id].append(episode_returns[agent_id])
-                    # 记录每个回合的奖励
-                    total_episodes = epoch * (args.step_per_epoch // 300) + (i // 300)
-                    writer.add_scalar(f'train/{agent_id}/episode_reward', 
-                                     episode_returns[agent_id], 
-                                     global_step=total_episodes)
-                
-                print(f"训练回合结束，步数: {episode_steps}, 奖励: {episode_returns}")
-                
-                # 重置环境和回报
-                obs_dict, _ = env.reset(seed=args.seed + epoch * 100 + i + 1)
-                episode_returns = {agent_id: 0.0 for agent_id in env.agents}
-                episode_steps = 0
-            
-            # 更新策略
-            if i % args.update_freq == 0:
-                for agent_id, policy in agents.items():
-                    # 确保缓冲区有足够的样本
-                    if len(buffers[agent_id]) >= args.batch_size:
-                        for _ in range(max(1, int(args.update_per_step * args.update_freq))):
-                            try:
-                                # 从经验回放缓冲区采样
-                                batch, indices = buffers[agent_id].sample(args.batch_size)
-                                
-                                # 确保batch包含必要字段
-                                if not hasattr(batch, 'returns') or batch.returns is None:
-                                    # 这里我们需要通过DQN的target网络计算下一个状态的价值估计
-                                    with torch.no_grad():
-                                        # 获取下一个状态的观测
-                                        next_obs = batch.obs_next
-                                        
-                                        # 使用policy的target网络计算价值估计
-                                        # DQN的情况，我们取每个动作价值的最大值作为状态价值
-                                        target_q = policy(Batch(
-                                            obs=next_obs, 
-                                            info={},  # 添加空的info字段以避免错误
-                                        )).logits.max(dim=1)[0]
-                                        target_q = target_q.cpu().numpy()
-                                    
-                                    # 计算returns
-                                    batch.returns = calculate_returns(
-                                        batch.rew.flatten().numpy() if torch.is_tensor(batch.rew) else batch.rew.flatten(),
-                                        args.gamma,
-                                        batch.done.flatten().numpy() if torch.is_tensor(batch.done) else batch.done.flatten(),
-                                        next_values=target_q,
-                                        n_step=args.n_step
-                                    )
-                                    batch.returns = torch.tensor(
-                                        batch.returns, dtype=torch.float32, device=device
-                                    ).reshape(-1, 1)
-                                
-                                # 更新策略 - DQN内部会计算真正的Q值目标
-                                losses = policy.learn(batch)
-                                
-                                # 记录损失 (确保losses有loss属性)
-                                if hasattr(losses, 'loss'):
-                                    writer.add_scalar(f'train/{agent_id}/loss', 
-                                                    losses.loss,
-                                                    global_step=epoch * args.step_per_epoch + i)
-                            except Exception as e:
-                                print(f"更新策略时出错: {e}")
+            if should_stop and episode > min_buffer_size:
+                print(f"Early stopping at episode {episode} due to no improvement")
+                break
         
-        # 记录每个智能体的平均回报
-        for agent_id in env.agents:
-            if epoch_returns[agent_id]:
-                avg_return = np.mean(epoch_returns[agent_id])
-                writer.add_scalar(f'train/{agent_id}/epoch_reward', avg_return, global_step=epoch)
-                print(f"{agent_id} - 平均奖励: {avg_return:.4f}")
-        
-        # 测试阶段
-        print("\n测试...")
-        for agent_id, policy in agents.items():
-            policy.eval()
-            policy.set_eps(args.eps_test)
-        
-        # 创建测试环境
-        test_env = make_env_fn(world="21_05", use_pred=use_predator, render=args.render_test)()
-        all_rewards = []
-        
-        for i in range(args.test_num):
-            episode_rewards = {agent_id: 0.0 for agent_id in test_env.agents}
-            obs_dict, _ = test_env.reset(seed=args.seed + 10000 + i)
-            done = False
-            step = 0
-            
-            while not done and step < 300:
-                actions = {}
-                for agent_id, policy in agents.items():
-                    # 提取观测
-                    agent_obs = obs_dict[agent_id]
-                    # 转换为张量
-                    obs_tensor = torch.tensor(
-                        agent_obs, 
-                        dtype=torch.float32, 
-                        device=device
-                    ).unsqueeze(0)
-                    
-                    with torch.no_grad():
-                        # 选择动作
-                        result = policy(Batch(obs=obs_tensor, info={}))
-                        # 提取动作
-                        if torch.is_tensor(result.act):
-                            action = result.act.item()
-                        else:
-                            action = int(result.act)
-                    
-                    actions[agent_id] = action
-                
-                # 执行动作
-                next_obs_dict, rewards, terminations, truncations, infos, done = test_env.step(actions)
-                print(f"测试回合 {i+1}/{args.test_num}, 步数: {step}, 奖励: {rewards}")
-                
-                # 更新奖励
-                for agent_id in test_env.agents:
-                    episode_rewards[agent_id] += rewards[agent_id]
-                
-                # 更新观测和步数
-                obs_dict = next_obs_dict
-                step += 1
-                
-                # 渲染
-                if args.render_test:
-                    test_env.render()
-                    time.sleep(0.01)
-            
-            # 检查任务完成情况
-            goal_reached = {}
-            captured = {}
-            for agent_id in test_env.agents:
-                # 检查是否达到目标
-                goal_reached[agent_id] = 0
-                captured[agent_id] = 0
-                if agent_id in infos:
-                    if "is_success" in infos[agent_id] and infos[agent_id]["is_success"]:
-                        goal_reached[agent_id] = 1
-                    if "captures" in infos[agent_id] and infos[agent_id]["captures"] > 0:
-                        captured[agent_id] = 1
-            
-            all_rewards.append([episode_rewards[agent_id] for agent_id in test_env.agents])
-            print(f"测试回合 {i+1}/{args.test_num}, 步数: {step}, 奖励: {episode_rewards}")
-            print(f"目标达成: {goal_reached}, 被捕获: {captured}")
-        
-        # 计算平均奖励
-        all_rewards = np.array(all_rewards)
-        avg_rewards = all_rewards.mean(axis=0)
-        for i, agent_id in enumerate(test_env.agents):
-            writer.add_scalar(f'test/{agent_id}/reward', avg_rewards[i], global_step=epoch)
-            print(f"{agent_id} 平均奖励: {avg_rewards[i]:.4f}")
-        
-        # 保存模型
-        if epoch == args.epoch - 1 or epoch % 5 == 0:
-            for agent_id, policy in agents.items():
-                torch.save(policy.state_dict(), os.path.join(log_path, f"{agent_id}_epoch{epoch}.pth"))
+        # Regularly save checkpoints
+        if episode % (log_interval * 20) == 0 and episode > 0:
+            for agent_name in env.agents:
+                checkpoint_path = os.path.join(log_dir, f"{agent_name}_ep{episode}.pt")
+                torch.save(agents[agent_name]["q_net"].state_dict(), checkpoint_path)
     
-    # 训练结束，保存最终模型
-    print("\n训练完成! 保存最终模型...")
-    for agent_id, policy in agents.items():
-        torch.save(policy.state_dict(), os.path.join(log_path, f"{agent_id}_final.pth"))
+    # Close environment
+    env.close()
     
-    writer.close()
-    # 返回训练好的智能体
-    return agents, log_path
+    # Save final models
+    for agent_name in env.agents:
+        model_path = os.path.join(log_dir, f"{agent_name}_final.pt")
+        torch.save(agents[agent_name]["q_net"].state_dict(), model_path)
+    
+    # Plot final reward curves
+    plot_rewards(rewards_history, log_dir)
+    
+    print("\nTraining complete!")
+    print(f"Logs and models saved to: {log_dir}")
 
-def test_dqn_agents(args, agents=None):
-    """测试训练好的DQN智能体"""
-    # 设置随机种子
-    set_seed(args.seed)
+def evaluate(model_paths, num_episodes=10, render=True):
+    """
+    评估已训练好的智能体模型
+    
+    参数:
+        model_paths: 字典，键为智能体名称，值为对应模型路径
+        num_episodes: 评估的回合数
+        render: 是否渲染环境
+    
+    返回:
+        评估结果统计信息
+    """
+    print(f"开始评估 {num_episodes} 个回合...")
     
     # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
     # 创建环境
-    use_predator = not getattr(args, 'no_predator', False)
-    env = make_env_fn(world="21_05", use_pred=use_predator, render=args.render_test)()
-    print(f"创建环境成功，智能体列表: {env.agents}")
+    env = make_env(
+        world_name="21_05",
+        use_lppos=True,
+        use_predator=True,
+        max_step=300,
+        reward_function=custom_reward,
+        time_step=0.25,
+        render=render,
+        real_time=render,
+        end_on_pov_goal=False,
+        use_other=True,
+        action_type=DualEvadeEnv.ActionType.DISCRETE
+    )
     
-    # 如果没有提供训练好的智能体，则尝试加载
-    if agents is None:
-        agents = {}
+    # 获取初始观察和动作空间维度
+    observations, _ = env.reset()
+    
+    # 初始化智能体模型
+    agents = {}
+    for agent_name in env.possible_agents:
+        obs_dim = env.observation_spaces[agent_name].shape[0]
         
-        # 获取观测和动作空间
-        obs_dict, _ = env.reset(seed=args.seed)
+        if isinstance(env.action_spaces[agent_name], gym.spaces.Discrete):
+            act_dim = env.action_spaces[agent_name].n
+        else:
+            raise ValueError("只支持离散动作空间")
         
-        for agent_id in env.agents:
-            # 获取观测维度和动作维度
-            obs_shape = len(obs_dict[agent_id])
-            action_dim = env.action_spaces[agent_id].n
-            
-            # 创建网络
-            net = make_dqn_net(
-                state_dim=obs_shape, 
-                action_dim=action_dim,
-                device=device,
-                hidden_sizes=args.hidden_sizes
-            )
-            
-            # 创建DQN策略
-            policy = DQNPolicy(
-                model=net,
-                optim=torch.optim.Adam(net.parameters(), lr=args.lr),
-                discount_factor=args.gamma,
-                estimation_step=args.n_step,
-                target_update_freq=args.target_update_freq,
-                action_space=env.action_spaces[agent_id],
-                is_double=True
-            )
-            
-            # 尝试加载模型
-            model_loaded = False
-            for model_type in ["final", "best"]:
-                model_path = os.path.join(args.save_path, f"{agent_id}_{model_type}.pth")
-                try:
-                    policy.load_state_dict(torch.load(model_path, map_location=device))
-                    print(f"加载 {agent_id} 的{model_type}模型: {model_path}")
-                    model_loaded = True
-                    break
-                except Exception as e:
-                    print(f"未找到或无法加载 {model_path}: {e}")
-            
-            if not model_loaded:
-                print(f"警告: {agent_id} 未找到训练好的模型，将使用随机策略!")
-            
-            agents[agent_id] = policy
+        # 创建模型
+        q_net = DuelingQnet(obs_dim, act_dim).to(device)
+        
+        # 加载模型权重
+        if agent_name in model_paths:
+            q_net.load_state_dict(torch.load(model_paths[agent_name], map_location=device))
+            print(f"已加载 {agent_name} 的模型: {model_paths[agent_name]}")
+        else:
+            print(f"警告: 未找到 {agent_name} 的模型路径")
+        
+        # 设置为评估模式
+        q_net.eval()
+        
+        agents[agent_name] = {
+            "q_net": q_net,
+            "obs_dim": obs_dim,
+            "act_dim": act_dim
+        }
     
-    # 设置为评估模式
-    for agent_id, policy in agents.items():
-        policy.eval()
-        policy.set_eps(args.eps_test)
+    # 统计数据
+    rewards_history = {agent_name: [] for agent_name in env.possible_agents}
+    episode_lengths = []
+    success_rates = {agent_name: 0 for agent_name in env.possible_agents}
+    capture_counts = {agent_name: 0 for agent_name in env.possible_agents}
     
-    # 运行测试回合
-    all_rewards = []
-    goal_reached = {agent_id: 0 for agent_id in env.agents}
-    captured = {agent_id: 0 for agent_id in env.agents}
-    
-    for i in range(args.test_num):
-        episode_rewards = {agent_id: 0.0 for agent_id in env.agents}
-        obs_dict, _ = env.reset(seed=args.seed + 20000 + i)
+    # 评估循环
+    for episode in range(num_episodes):
+        # 重置环境
+        observations, _ = env.reset()
+        
+        # 记录单个回合信息
+        episode_rewards = {agent_name: 0.0 for agent_name in env.agents}
+        step_count = 0
         done = False
-        step = 0
         
-        while not done and step < 300:
+        # 回合循环
+        while not done:
+            # 记录步数
+            step_count += 1
+            
+            # 每个智能体选择动作
             actions = {}
-            for agent_id, policy in agents.items():
-                # 提取观测
-                agent_obs = obs_dict[agent_id]
-                # 转换为张量
-                obs_tensor = torch.tensor(
-                    agent_obs, 
-                    dtype=torch.float32, 
-                    device=device
-                ).unsqueeze(0)
+            for agent_name in env.agents:
+                obs = observations[agent_name]
+                # 移动观察到设备
+                obs_tensor = torch.tensor(obs, dtype=torch.float).to(device)
                 
+                # 使用Q网络选择最优动作（无探索）
                 with torch.no_grad():
-                    # 选择动作
-                    result = policy(Batch(obs=obs_tensor, info={}))
-                    # 提取动作
-                    if torch.is_tensor(result.act):
-                        action = result.act.item()
-                    else:
-                        action = int(result.act)
-                
-                actions[agent_id] = action
+                    if obs_tensor.dim() == 1:
+                        obs_tensor = obs_tensor.unsqueeze(0)
+                    q_values = agents[agent_name]["q_net"](obs_tensor)
+                    action = q_values.argmax().item()
+                    actions[agent_name] = action
             
             # 执行动作
-            next_obs_dict, rewards, terminations, truncations, infos, done = env.step(actions)
+            next_observations, rewards, terminations, truncations, infos = env.step(actions)
             
-            # 更新奖励
-            for agent_id in env.agents:
-                episode_rewards[agent_id] += rewards[agent_id]
+            # 更新回合奖励
+            for agent_name in env.agents:
+                episode_rewards[agent_name] += rewards[agent_name]
             
-            # 更新观测和步数
-            obs_dict = next_obs_dict
-            step += 1
+            # 更新观察
+            observations = next_observations
             
-            # 渲染
-            if args.render_test:
-                env.render()
-                time.sleep(0.01)
+            # 检查回合是否结束
+            done = all(terminations.values()) or all(truncations.values())
         
-        # 检查任务完成情况
-        for agent_id in env.agents:
-            # 检查是否达到目标
-            if agent_id in infos:
-                if "is_success" in infos[agent_id] and infos[agent_id]["is_success"]:
-                    goal_reached[agent_id] += 1
-                if "captures" in infos[agent_id] and infos[agent_id]["captures"] > 0:
-                    captured[agent_id] += 1
+        # 记录结果
+        episode_lengths.append(step_count)
         
-        all_rewards.append([episode_rewards[agent_id] for agent_id in env.agents])
-        print(f"测试回合 {i+1}/{args.test_num}, 步数: {step}, 奖励: {episode_rewards}")
+        # 收集每个智能体的统计信息
+        for agent_name in env.agents:
+            rewards_history[agent_name].append(episode_rewards[agent_name])
+            
+            # 检查成功和被捕获信息
+            if agent_name in infos and "is_success" in infos[agent_name]:
+                if infos[agent_name]["is_success"]:
+                    success_rates[agent_name] += 1
+            
+            if agent_name in infos and "captures" in infos[agent_name]:
+                if infos[agent_name]["captures"] > 0:
+                    capture_counts[agent_name] += 1
+        
+        # 打印单回合结果
+        print(f"回合 {episode+1}/{num_episodes} - 步数: {step_count}")
+        for agent_name in env.agents:
+            print(f"  {agent_name} - 奖励: {episode_rewards[agent_name]:.4f}")
     
-    # 计算平均奖励
-    all_rewards = np.array(all_rewards)
-    avg_rewards = all_rewards.mean(axis=0)
-    print("\n测试结果:")
-    for i, agent_id in enumerate(env.agents):
-        print(f"{agent_id} 平均奖励: {avg_rewards[i]:.4f}")
+    # 计算总体统计信息
+    print("\n===== 评估结果 =====")
+    print(f"总回合数: {num_episodes}")
+    print(f"平均回合长度: {sum(episode_lengths)/len(episode_lengths):.2f} 步")
     
-    # 打印目标达成和被捕获统计
-    print("\n目标达成次数:")
-    for agent_id in env.agents:
-        success_rate = goal_reached[agent_id] / args.test_num * 100
-        print(f"  {agent_id}: {goal_reached[agent_id]}/{args.test_num} ({success_rate:.1f}%)")
+    for agent_name in env.possible_agents:
+        avg_reward = sum(rewards_history[agent_name]) / num_episodes
+        success_rate = success_rates[agent_name] / num_episodes * 100
+        capture_rate = capture_counts[agent_name] / num_episodes * 100
+        
+        print(f"\n{agent_name} 统计:")
+        print(f"  平均奖励: {avg_reward:.4f}")
+        print(f"  成功率: {success_rate:.2f}%")
+        print(f"  被捕获率: {capture_rate:.2f}%")
     
-    print("\n被捕获次数:")
-    for agent_id in env.agents:
-        capture_rate = captured[agent_id] / args.test_num * 100
-        print(f"  {agent_id}: {captured[agent_id]}/{args.test_num} ({capture_rate:.1f}%)")
+    # 关闭环境
+    env.close()
     
-    return all_rewards
+    return {
+        "rewards": rewards_history,
+        "episode_lengths": episode_lengths,
+        "success_rates": success_rates,
+        "capture_counts": capture_counts
+    }
 
+# 示例用法
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # 训练参数
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epoch", type=int, default=10)
-    parser.add_argument("--step-per-epoch", type=int, default=6000)
-    parser.add_argument("--update-freq", type=int, default=1)
-    parser.add_argument("--update-per-step", type=float, default=1)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
-    parser.add_argument("--test-num", type=int, default=10)
-    parser.add_argument("--buffer-size", type=int, default=500000)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--n-step", type=int, default=1)
-    parser.add_argument("--target-update-freq", type=int, default=100)
-    parser.add_argument("--eps-start", type=float, default=1.0, help="初始探索率")
-    parser.add_argument("--eps-min", type=float, default=0.05, help="最小探索率")
-    parser.add_argument("--eps-decay", type=float, default=0.95, help="每个epoch的探索率衰减因子")
-    parser.add_argument("--eps-decay-steps", type=int, default=20000, help="探索率从初始值衰减到最小值所需的总步数")
-    parser.add_argument("--eps-test", type=float, default=0.05)
-    parser.add_argument("--no-predator", action="store_true", help="禁用捕食者")
-    parser.add_argument("--logdir", type=str, default="./log")
-    parser.add_argument("--save-path", type=str, default="./log/dqn/policy")
-    parser.add_argument("--render-test", action="store_true", help="测试时渲染环境")
-    parser.add_argument("--test-only", action="store_true", help="仅测试不训练")
-
-    # 如果是在IPython或Jupyter环境中
-    try:
-        import sys
-        if "ipykernel" in sys.modules:
-            # Jupyter环境下设置默认参数，以方便快速测试
-            args = parser.parse_args([
-                "--epoch", "2", 
-                "--step-per-epoch", "500",
-                "--test-num", "2",
-                "--render-test"
-            ])
-        else:
-            args = parser.parse_args()
-    except:
-        args = parser.parse_args()
+    import argparse
     
-    # 如果是测试模式
-    if args.test_only:
-        test_dqn_agents(args)
-    else:
-        # 训练并测试
-        agents, log_path = train_dqn_agents(args)
-        # 更新保存路径
-        args.save_path = log_path
-        # 测试
-        test_dqn_agents(args, agents) 
+    parser = argparse.ArgumentParser(description='DQN训练或评估')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'],
+                        help='运行模式: train (训练) 或 eval (评估)')
+    parser.add_argument('--model_dir', type=str, default=None,
+                        help='评估模式下，模型所在文件夹路径')
+    parser.add_argument('--episodes', type=int, default=10,
+                        help='评估模式下，评估的回合数')
+    parser.add_argument('--render', action='store_true',
+                        help='是否渲染环境')
+    
+    args = parser.parse_args()
+    
+    if args.mode == 'train':
+        main()
+    elif args.mode == 'eval':
+        if args.model_dir:
+            # 构建模型路径
+            model_paths = {}
+            for agent in ["prey_1", "prey_2"]:
+                # 尝试读取 best, final 或特定回合的模型
+                best_path = os.path.join(args.model_dir, f"{agent}_bes.pt")
+                final_path = os.path.join(args.model_dir, f"{agent}_final.pt")
+                
+                if os.path.exists(best_path):
+                    model_paths[agent] = best_path
+                elif os.path.exists(final_path):
+                    model_paths[agent] = final_path
+                else:
+                    # 尝试找到最新的checkpoint
+                    agent_models = [f for f in os.listdir(args.model_dir) if f.startswith(agent) and f.endswith('.pt')]
+                    if agent_models:
+                        model_paths[agent] = os.path.join(args.model_dir, agent_models[-1])
+                    else:
+                        print(f"错误: 未找到 {agent} 的模型")
+            
+            if model_paths:
+                evaluate(model_paths, num_episodes=args.episodes, render=args.render)
+            else:
+                print("错误: 未找到模型文件")
+        else:
+            print("错误: 评估模式需要指定模型目录 (--model_dir)")
