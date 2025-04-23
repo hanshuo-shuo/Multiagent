@@ -8,28 +8,32 @@ import collections
 import random
 import os
 import argparse
+import matplotlib.pyplot as plt
 from pz_env import MultiDualEvadeEnv
 from env import DualEvadeEnv
 from reward import custom_reward
 
 # Hyperparameters
-lr_pi = 0.0005
-lr_q = 0.001
-init_alpha = 0.01
-gamma = 0.98
-batch_size = 64
-buffer_limit = 100000
-tau = 0.01  # for target network soft update
+lr_pi = 0.0003
+lr_q = 0.0003
+init_alpha = 0.2
+gamma = 0.99
+batch_size = 256
+buffer_limit = 1000000
+tau = 0.005  # for target network soft update (slower updates for better stability)
 target_entropy = -2.0  # for automated alpha update (depends on action space dimension)
-lr_alpha = 0.001  # for automated alpha update
-train_interval = 50  # 每个智能体每隔多少步进行一次训练
-update_iterations = 20  # 每次训练更新多少次
-start_training = 1000  # 开始训练前需要收集的经验数量
+lr_alpha = 0.0003  # for automated alpha update
+train_interval = 1  # 每个智能体每隔多少步进行一次训练
+update_iterations = 1  # 每次训练更新多少次
+num_gradients_per_step = 1  # 每步环境交互执行的梯度更新次数
+start_training = 5000  # 开始训练前需要收集的经验数量
 print_interval = 10  # 每多少个episode打印一次结果
-max_episodes = 10  # 最大训练回合数
+max_episodes = 300  # 最大训练回合数
 max_steps = 300  # 每个回合最大步数
-save_interval = 100  # 每多少个episode保存一次模型
+save_interval = 10  # 每多少个episode保存一次模型
 model_path = "log/sac"  # 模型保存路径
+hidden_dim = 256  # 隐藏层维度
+reward_scale = 1.0  # 奖励缩放系数，用于调整熵正则化的影响
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"{'GPU is' if torch.cuda.is_available() else 'GPU is not'} available, using {'GPU' if torch.cuda.is_available() else 'CPU'} instead")
@@ -73,10 +77,11 @@ class ReplayBuffer:
 class PolicyNet(nn.Module):
     def __init__(self, state_dim, action_dim, action_bound):
         super(PolicyNet, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc_mu = nn.Linear(128, action_dim)
-        self.fc_std = nn.Linear(128, action_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_std = nn.Linear(hidden_dim, action_dim)
         self.optimizer = optim.Adam(self.parameters(), lr=lr_pi)
         
         # For automated entropy tuning
@@ -89,6 +94,7 @@ class PolicyNet(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x)) + 1e-3  # To avoid std being too small
         
@@ -139,10 +145,11 @@ class PolicyNet(nn.Module):
 class QNet(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(QNet, self).__init__()
-        self.fc_s = nn.Linear(state_dim, 128)
-        self.fc_a = nn.Linear(action_dim, 128)
-        self.fc_cat = nn.Linear(256, 128)
-        self.fc_out = nn.Linear(128, 1)
+        self.fc_s = nn.Linear(state_dim, hidden_dim)
+        self.fc_a = nn.Linear(action_dim, hidden_dim)
+        self.fc_cat = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc_hidden = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
         self.optimizer = optim.Adam(self.parameters(), lr=lr_q)
 
     def forward(self, x, a):
@@ -150,6 +157,7 @@ class QNet(nn.Module):
         h2 = F.relu(self.fc_a(a))
         cat = torch.cat([h1, h2], dim=1)
         q = F.relu(self.fc_cat(cat))
+        q = F.relu(self.fc_hidden(q))
         q = self.fc_out(q)
         return q
 
@@ -205,7 +213,92 @@ def load_models(agent_name, episode, state_dim, action_dim, action_bound):
     
     return pi, q1, q2, q1_target, q2_target
 
-
+def plot_training_results(scores, success_rates, save_path=None, window_size=5):
+    """
+    绘制训练结果图表，包括两个智能体的reward和success rate变化
+    
+    参数:
+    - scores: 各智能体的奖励记录字典
+    - success_rates: 各智能体的成功率记录字典
+    - save_path: 图表保存路径，如不指定则只显示不保存
+    - window_size: 移动平均窗口大小
+    """
+    # 获取智能体名称
+    agent_names = list(scores.keys())
+    
+    # 创建包含两行两列的子图
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 为每个智能体绘制reward图表和success rate图表
+    for i, agent_name in enumerate(agent_names):
+        agent_scores = scores[agent_name]
+        agent_success_rates = success_rates[agent_name]
+        
+        # 绘制reward图表（左列）
+        ax_reward = axes[i, 0]
+        
+        # 计算移动平均
+        if len(agent_scores) > window_size:
+            # 计算移动平均
+            cumsum = np.cumsum(np.insert(agent_scores, 0, 0))
+            smoothed_scores = (cumsum[window_size:] - cumsum[:-window_size]) / float(window_size)
+            
+            # 绘制原始数据（半透明）
+            ax_reward.plot(np.arange(len(agent_scores)), agent_scores, 
+                          alpha=0.3, color='C'+str(i), label=f'{agent_name} (raw)')
+            
+            # 绘制平滑后的数据
+            ax_reward.plot(np.arange(window_size-1, len(agent_scores)), 
+                          smoothed_scores, linewidth=2, color='C'+str(i), 
+                          label=f'{agent_name} (smoothed)')
+        else:
+            ax_reward.plot(np.arange(len(agent_scores)), agent_scores, 
+                          label=agent_name)
+        
+        ax_reward.set_title(f'{agent_name} Reward')
+        ax_reward.set_xlabel('Episode')
+        ax_reward.set_ylabel('Episode Reward')
+        ax_reward.grid(True, linestyle='--', alpha=0.7)
+        ax_reward.legend()
+        
+        # 绘制success rate图表（右列）
+        ax_success = axes[i, 1]
+        
+        # 计算累积成功率
+        cumulative_success = np.cumsum(agent_success_rates)
+        episodes = np.arange(1, len(agent_success_rates) + 1)
+        cumulative_success_rate = cumulative_success / episodes
+        
+        # 绘制累积成功率
+        ax_success.plot(episodes, cumulative_success_rate, 
+                       linewidth=2, color='C'+str(i), label=agent_name)
+        
+        # 如果有数据，显示最终成功率
+        if len(cumulative_success_rate) > 0:
+            final_success_rate = cumulative_success_rate[-1]
+            ax_success.text(len(episodes), final_success_rate,
+                          f' {final_success_rate:.2f}',
+                          verticalalignment='center')
+        
+        ax_success.set_title(f'{agent_name} Success Rate')
+        ax_success.set_xlabel('Episode')
+        ax_success.set_ylabel('Success Rate')
+        ax_success.set_ylim([0, 1.05])
+        ax_success.grid(True, linestyle='--', alpha=0.7)
+        ax_success.legend()
+    
+    # 调整子图布局
+    plt.tight_layout()
+    
+    # 保存图表（如果指定了保存路径）
+    if save_path:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300)
+        print(f"Training results plot saved to: {save_path}")
+    
+    # 显示图表
+    plt.show()
 
 def main(args):
     
@@ -213,7 +306,7 @@ def main(args):
     env_kwargs = {
         'world_name': args.world_name,
         'use_lppos': args.use_lppos,
-        'use_predator': True,
+        'use_predator': args.use_predator,
         'max_step': args.max_step,
         'time_step': args.time_step,
         'render': args.render,
@@ -259,6 +352,7 @@ def main(args):
     episode_success = {agent: 0 for agent in env.agents}
     
     total_step = 0
+    gradient_steps = 0
     
     for n_epi in range(1, max_episodes+1):
         observations, infos = env.reset()
@@ -280,8 +374,9 @@ def main(args):
                 
                 # 如果经验足够则使用策略，否则随机探索
                 if memory[agent_name].size() > start_training:
-                    action, _ = pi(obs)
-                    action = action.squeeze().cpu().detach().numpy()
+                    with torch.no_grad():
+                        action, _ = pi(obs)
+                        action = action.squeeze().cpu().detach().numpy()
                 else:
                     action = np.random.uniform(0, 1, size=act_dim)
                 
@@ -298,7 +393,7 @@ def main(args):
                 memory[agent_name].put((
                     observations[agent_name],
                     actions[agent_name],
-                    rewards[agent_name],
+                    rewards[agent_name] * reward_scale,  # 应用奖励缩放
                     next_observations[agent_name],
                     done
                 ))
@@ -309,25 +404,29 @@ def main(args):
             # 更新观测
             observations = next_observations
             
-            # 训练智能体
-            if total_step % train_interval == 0 and all(memory[agent].size() > start_training for agent in env.agents):
-                for agent_name in env.agents:
-                    pi, q1, q2, q1_target, q2_target = agents[agent_name]
-                    
-                    for _ in range(update_iterations):
-                        mini_batch = memory[agent_name].sample(batch_size)
-                        
-                        # 更新Q网络
-                        td_target = calc_target(pi, q1_target, q2_target, mini_batch)
-                        q1.train_net(td_target, mini_batch)
-                        q2.train_net(td_target, mini_batch)
-                        
-                        # 更新策略网络
-                        pi.train_net(q1, q2, mini_batch)
-                        
-                        # 软更新目标网络
-                        q1.soft_update(q1_target)
-                        q2.soft_update(q2_target)
+            # 训练智能体 - 改为按照环境步数和梯度步数比例来更新
+            if memory[agent_name].size() > start_training:
+                if total_step % train_interval == 0:
+                    for _ in range(num_gradients_per_step):
+                        for agent_name in env.agents:
+                            pi, q1, q2, q1_target, q2_target = agents[agent_name]
+                            
+                            for _ in range(update_iterations):
+                                mini_batch = memory[agent_name].sample(batch_size)
+                                
+                                # 更新Q网络
+                                td_target = calc_target(pi, q1_target, q2_target, mini_batch)
+                                q1.train_net(td_target, mini_batch)
+                                q2.train_net(td_target, mini_batch)
+                                
+                                # 更新策略网络
+                                pi.train_net(q1, q2, mini_batch)
+                                
+                                # 软更新目标网络
+                                q1.soft_update(q1_target)
+                                q2.soft_update(q2_target)
+                                
+                                gradient_steps += 1
             
             total_step += 1
             step += 1
@@ -350,7 +449,8 @@ def main(args):
                 avg_success = np.mean(success_rates[agent_name][-print_interval:])
                 
                 print(f"Episode {n_epi}, {agent_name}: Avg Score: {avg_score:.2f}, "
-                      f"Success Rate: {avg_success:.2f}, Alpha: {pi.log_alpha.exp().item():.4f}")
+                      f"Success Rate: {avg_success:.2f}, Alpha: {pi.log_alpha.exp().item():.4f}, "
+                      f"Gradient Steps: {gradient_steps}")
         
         # 保存模型
         if n_epi % save_interval == 0:
@@ -358,7 +458,7 @@ def main(args):
                 save_models(agents[agent_name], agent_name, n_epi)
             
             # 保存训练进度信息
-            progress_file = f"{model_path}/training_progress_{args.reward_type}.npy"
+            progress_file = f"{model_path}/training_progress_{args.world_name}.npy"
             np.save(progress_file, {
                 'episode': n_epi,
                 'scores': scores,
@@ -367,20 +467,24 @@ def main(args):
     
     # 关闭环境
     env.close()
+    
+    # 在训练结束后绘制结果图表
+    if args.plot_results:
+        plot_file = f"{model_path}/training_results_{args.world_name}.png"
+        plot_training_results(scores, success_rates, save_path=plot_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-agent SAC training for dual evade environment")
     
     parser.add_argument("--world_name", type=str, default="21_05", help="World configuration")
     parser.add_argument("--use_lppos", action="store_true", help="Use limited action list")
-    parser.add_argument("--use_predator", action="store_true", help="Use predator in environment")
+    parser.add_argument("--use_predator", default=True, help="Use predator in environment")
     parser.add_argument("--max_step", type=int, default=300, help="Maximum steps per episode")
     parser.add_argument("--time_step", type=float, default=0.25, help="Time step for environment")
-    parser.add_argument("--render", action="store_true", help="Render environment")
-    parser.add_argument("--real_time", action="store_true", help="Run in real time")
-    parser.add_argument("--end_on_pov_goal", action="store_true", help="End episode when POV reaches goal")
-    parser.add_argument("--reward_type", type=str, default="goal", choices=["goal", "survival", "coop"], 
-                       help="Reward function type: goal (distance-based), survival (survival-based), coop (cooperation)")
+    parser.add_argument("--render", default=False, help="Render environment")
+    parser.add_argument("--real_time", default=False, help="Run in real time")
+    parser.add_argument("--end_on_pov_goal", default=False, help="End episode when POV reaches goal")
+    parser.add_argument("--plot_results", action="store_true", help="Plot training results after training")
     
     args = parser.parse_args()
     
