@@ -90,11 +90,11 @@ They see each other:
 
 ![image](https://github.com/user-attachments/assets/30f19f92-04bd-4b42-95c4-192effe1c94a)
 
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/6e728b65-76e0-4b99-8a63-6ca3d6d54d67" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/91998b3e-b0dc-4bc8-988b-2bddd7d3b80a" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/1501fc78-a0a1-4eff-9cde-bc317731b93d" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/e5ef1615-df0e-4013-bd64-857cc118d243" />
-<img width="200" alt="image" src="https://github.com/user-attachments/assets/ed2b4c85-62f6-4e3a-ad02-258783f6adf4" />
+<img width="195" alt="image" src="https://github.com/user-attachments/assets/6e728b65-76e0-4b99-8a63-6ca3d6d54d67" />
+<img width="195" alt="image" src="https://github.com/user-attachments/assets/91998b3e-b0dc-4bc8-988b-2bddd7d3b80a" />
+<img width="195" alt="image" src="https://github.com/user-attachments/assets/1501fc78-a0a1-4eff-9cde-bc317731b93d" />
+<img width="195" alt="image" src="https://github.com/user-attachments/assets/e5ef1615-df0e-4013-bd64-857cc118d243" />
+<img width="195" alt="image" src="https://github.com/user-attachments/assets/ed2b4c85-62f6-4e3a-ad02-258783f6adf4" />
 
 
 
