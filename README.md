@@ -70,10 +70,32 @@ python train_dqn.py --epoch 30 --step-per-epoch 2000 --test-num 1 --batch-size 2
 - TensorBoard logging for tracking training progress
 
 
-# SAC 马太效应 and DQN 
+# SAC and DQN 
+
+When there is no predator: very stable and they will eventually share the simliar policy and behavior:
+
+![image](https://github.com/user-attachments/assets/318b7706-4f31-42bc-be63-9af6ceb5a480)
+
+<img width="500" alt="image" src="https://github.com/user-attachments/assets/b6dabf15-73c1-4cf1-a2ad-c6c232f97f9a" />
+<img width="500" alt="image" src="https://github.com/user-attachments/assets/8745c809-fd45-41ee-9871-a5c3e849b55e" />
+
+
 They don't see each other: 
 
 ![image](https://github.com/user-attachments/assets/f1fee172-2dc4-470c-a0e2-db422cdfeb09)
 
+
+
 They see each other: 
+
+![image](https://github.com/user-attachments/assets/30f19f92-04bd-4b42-95c4-192effe1c94a)
+
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/6e728b65-76e0-4b99-8a63-6ca3d6d54d67" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/91998b3e-b0dc-4bc8-988b-2bddd7d3b80a" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/1501fc78-a0a1-4eff-9cde-bc317731b93d" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/e5ef1615-df0e-4013-bd64-857cc118d243" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/ed2b4c85-62f6-4e3a-ad02-258783f6adf4" />
+
+
+
 
