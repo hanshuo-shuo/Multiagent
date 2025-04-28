@@ -1,43 +1,50 @@
-## Related Prior Work:
 
-**Emergent Flocking Behavior with Multi-Agent Reinforcement Learning**  
+## Related Prior Work
+
+**Emergent Escape-based Flocking Behavior using Multi-Agent Reinforcement Learning**  
 [https://arxiv.org/abs/1905.04077](https://arxiv.org/abs/1905.04077)
 
-This work asks whether **agents trained solely to survive** in the presence of a predator (with no explicit flocking rules or rewards) will nevertheless **emerge into flocking behavior**.  
-They propose the **SELFish framework**, and show that flock‐like formations arise even in a **continuous action setting**, purely from the objective of **maximizing survival time**.
+This paper asks if **agents trained only to survive** (without any rules or rewards for flocking) will **still show flocking behavior**.  
+They build a system called **SELFish**, and show that **agents form flocks** even when the only goal is to **stay alive as long as possible**.
 
 **Limitations:**
-1. **Single-agent training:**  
-   - Although at deployment the learned network is copied across the whole group, **during training only one learning agent interacts** with static copies of itself in the environment.  
-   - Thus, there is **no true multi-agent game** or **co-learning process**.  
-   - The framework cannot capture or evaluate stability, cooperation, or competition under **policy heterogeneity**.
+1. **Only one agent learned:**  
+   - During training, **only one agent was learning**, while the others were just copies.  
+   - There was **no real multi-agent learning** or interaction between different agents.  
+   - This means they could not test how different strategies might work together (or against each other).
 
-2. **Over-simplified environment:**  
-   - No obstacles, no terrain variation; agents and predator move in a simple open bounded arena.  
-   - The model ignores environmental complexities (e.g., cover, bottlenecks) common in real-world swarm behavior.  
-   - The reward function is purely based on **survival time**: no foraging, migration, or collective tasks are modeled, limiting it to a narrow “fleeing” dynamic.
+2. **Too simple environment:**  
+   - No obstacles, no hills, no places to hide — just an open, flat space.  
+   - Agents only had one goal: **stay alive**.  
+   - There were no other challenges like **finding food**, **moving to new areas**, or **sharing resources**, which are common in real animal groups.
+
 
 
 **Collective Adaptation in Multi-Agent Systems: How Predator Confusion Shapes Swarm-Like Behaviors**  
 [https://arxiv.org/abs/2209.06338](https://arxiv.org/abs/2209.06338)
 
-This study extends the exploration of predator-driven collective behaviors, running experiments with **15 and 60 agents** and **one predator**.  
-It compares two observation models:
-- **GOM (Global Observation Model):** Agents can always observe the predator.
-- **LOM (Local Observation Model):** Agents have limited, localized perception.
+This paper looks at how **predator confusion** can make group behaviors appear.  
+They ran tests with **15 or 60 agents** and **one predator**.  
+They compared two ways of seeing:
+- **GOM (Global Observation Model):** Agents can always see the predator.
+- **LOM (Local Observation Model):** Agents can only see nearby things.
 
 **Limitations:**
-- **Shared policy across all agents:**  
-  - All 15 or 60 agents share a **single trained policy**.  
-  - No independent learning or adaptation; thus, observed group behavior largely reflects **policy cloning** rather than **true emergent social structure**.
+- **All agents shared one brain:**  
+  - Every agent used the **same trained policy**.  
+  - They did not learn separately.  
+  - As a result, group behaviors were really just **copies of one agent’s behavior**, not real teamwork.
 
-- **Artificial convergence:**  
-  - Using the same neural network for all agents inevitably homogenizes behavior, masking the complexities of coordination, role differentiation, or conflict seen in real multi-agent systems.
+- **Fake group behavior:**  
+  - Because all agents used the same brain, their group actions looked organized, but were not the result of real cooperation or decision-making between different agents.
+
 
 
 **In summary:**  
-Both studies conflate **policy replication artifacts** with **genuine emergent social dynamics**.  
-Their findings, while suggestive, are fundamentally limited by **single-policy architectures** and **over-simplified environments**, leaving open the challenge of demonstrating truly emergent, diverse, and adaptive group behavior in more realistic multi-agent predator-prey settings.
+Both papers confuse **copying the same behavior** with **real emergent teamwork**.  
+Because they use **only one shared policy** and **too simple environments**, they miss the chance to show **true complex group behaviors** like those seen in nature.
+
+
 
 
 # Multi-Agent Reinforcement Learning for Predator-Prey Environment
