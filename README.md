@@ -8,19 +8,16 @@ This paper asks if **agents trained only to survive** (without any rules or rewa
 They build a system called **SELFish**, and show that **agents form flocks** even when the only goal is to **stay alive as long as possible**.
 
 **Limitations:**
-1. **Only one agent learned:**  
-   - During training, **only one agent was learning**, while the others were just copies.  
-   - There was **no real multi-agent learning** or interaction between different agents.  
-   - This means they could not test how different strategies might work together (or against each other).
 
-2. **Too simple environment:**  
-   - No obstacles, no hills, no places to hide — just an open, flat space.  
-   - Agents only had one goal: **stay alive**.  
-   - There were no other challenges like **finding food**, **moving to new areas**, or **sharing resources**, which are common in real animal groups.
+ **Only one agent learned:** During training, **only one agent was learning**, while the others were just copies.  There was **no real multi-agent learning** or interaction between different agents. This means they could not test how different strategies might work together (or against each other).
+
+ **Too simple environment:**
+   - No obstacles, no hills, no places to hide — just an open, flat space.  Agents only had one goal: **stay alive**. There were no other challenges like **finding food**, **moving to new areas**.
 
 
 
 **Collective Adaptation in Multi-Agent Systems: How Predator Confusion Shapes Swarm-Like Behaviors**  
+
 [https://arxiv.org/abs/2209.06338](https://arxiv.org/abs/2209.06338)
 
 This paper looks at how **predator confusion** can make group behaviors appear.  
@@ -31,12 +28,8 @@ They compared two ways of seeing:
 
 **Limitations:**
 - **All agents shared one brain:**  
-  - Every agent used the **same trained policy**.  
-  - They did not learn separately.  
-  - As a result, group behaviors were really just **copies of one agent’s behavior**, not real teamwork.
-
-- **Fake group behavior:**  
-  - Because all agents used the same brain, their group actions looked organized, but were not the result of real cooperation or decision-making between different agents.
+  - Every agent used the **same trained policy**. They did not learn separately. As a result, group behaviors were really just **copies of one agent’s behavior**, not real teamwork.
+-  Because all agents used the same brain, their group actions looked organized, but were not the result of real cooperation or decision-making between different agents.
 
 
 
