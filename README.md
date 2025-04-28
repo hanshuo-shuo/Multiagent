@@ -99,6 +99,8 @@ They see each other:
 <img width="195" alt="image" src="https://github.com/user-attachments/assets/e5ef1615-df0e-4013-bd64-857cc118d243" />
 <img width="195" alt="image" src="https://github.com/user-attachments/assets/ed2b4c85-62f6-4e3a-ad02-258783f6adf4" />
 
+CHecklist: Paraller env setting, larger batchsize, smaller learning rate.
 
 
-
+[https://openreview.net/forum?id=SJxu5iR9KQ&utm_source=chatgpt.com](https://openreview.net/forum?id=SJxu5iR9KQ)
+https://arxiv.org/abs/2401.07056
