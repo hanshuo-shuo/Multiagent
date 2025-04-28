@@ -80,6 +80,9 @@ When there is no predator: very stable and they will eventually share the simlia
 <img width="500" alt="image" src="https://github.com/user-attachments/assets/8745c809-fd45-41ee-9871-a5c3e849b55e" />
 
 
+
+But when there is predator, their performance and training will be very different. Even under two setting: 
+
 They don't see each other: 
 
 ![image](https://github.com/user-attachments/assets/f1fee172-2dc4-470c-a0e2-db422cdfeb09)
