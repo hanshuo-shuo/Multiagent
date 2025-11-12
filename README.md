@@ -104,3 +104,6 @@ CHecklist: Paraller env setting, larger batchsize, smaller learning rate.
 
 [https://openreview.net/forum?id=SJxu5iR9KQ&utm_source=chatgpt.com](https://openreview.net/forum?id=SJxu5iR9KQ)
 https://arxiv.org/abs/2401.07056
+
+
+## Multiagent in LLM
